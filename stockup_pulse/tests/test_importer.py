@@ -3,6 +3,7 @@ from io import BytesIO
 import pytest
 from openpyxl import Workbook
 
+import stockup_pulse.ingest.importer as importer
 from stockup_pulse.ingest.importer import (
     ImportValidationError,
     normalize_leaflet_candidates,
@@ -44,6 +45,32 @@ def test_xlsx_sales_and_stock_sheets_are_parsed():
 
     assert imported["sales"]["rice 2kg"] == {"2025-02-01": 7.0}
     assert imported["stock"]["rice 2kg"] == 3.0
+
+
+def test_xlsx_rejects_workbooks_exceeding_expansion_limit(monkeypatch):
+    workbook = Workbook()
+    workbook.active.title = "sales"
+    workbook.active.append(["date", "product", "quantity_sold"])
+    workbook.active.append(["2025-02-01", "Rice", 7])
+    content = BytesIO()
+    workbook.save(content)
+    monkeypatch.setattr(importer, "XLSX_MAX_UNCOMPRESSED_BYTES", 1)
+
+    with pytest.raises(ImportValidationError, match="expands beyond"):
+        parse_sales_stock_files([("store.xlsx", content.getvalue())])
+
+
+def test_xlsx_rejects_worksheets_exceeding_row_limit(monkeypatch):
+    workbook = Workbook()
+    workbook.active.title = "sales"
+    workbook.active.append(["date", "product", "quantity_sold"])
+    workbook.active.append(["2025-02-01", "Rice", 7])
+    content = BytesIO()
+    workbook.save(content)
+    monkeypatch.setattr(importer, "XLSX_MAX_ROWS", 1)
+
+    with pytest.raises(ImportValidationError, match="exceeds the row or column"):
+        parse_sales_stock_files([("store.xlsx", content.getvalue())])
 
 
 @pytest.mark.parametrize(

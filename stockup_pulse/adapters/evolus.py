@@ -62,7 +62,16 @@ class EvolusAdapter:
             details={"task": "pdf_extraction"},
         ))
 
-    def extract_document(self, file_content: bytes, filename: str) -> Dict[str, Any]:
+    def extract_document(
+        self,
+        file_content: bytes,
+        filename: str,
+        prompt: str = (
+            "Extract the leaflet's clearly observed products, pack sizes, pack prices, "
+            "supplier, currency, availability, and short evidence as JSON. Do not estimate "
+            "missing values or calculate retail prices, demand, or order quantities."
+        ),
+    ) -> Dict[str, Any]:
         if not filename.lower().endswith(".pdf"):
             raise ValueError("Evolus document extraction accepts PDF files only.")
         started = time.perf_counter()
@@ -78,18 +87,20 @@ class EvolusAdapter:
                 submitted = client.post(
                     execute_url,
                     headers=self._headers(),
-                    data={"input": "Extract the leaflet's product, pack size, pack price, and supplier as JSON."},
+                    data={"input": prompt},
                     files={"file": (filename, file_content, "application/pdf")},
                 )
                 if submitted.status_code != 202:
                     raise EvolusRequestError(f"Evolus workflow submission returned HTTP {submitted.status_code}.")
-                try:
-                    submission = submitted.json()
-                except ValueError as exc:
-                    raise EvolusRequestError("Evolus workflow submission returned invalid JSON.") from exc
-                if not isinstance(submission, dict):
-                    raise EvolusRequestError("Evolus workflow submission returned an invalid response.")
-                execution_id = submission.get("executionId") or submitted.headers.get("X-Workflow-Execution-Id")
+                execution_id = submitted.headers.get("X-Workflow-Execution-Id")
+                if not execution_id:
+                    try:
+                        submission = submitted.json()
+                    except ValueError as exc:
+                        raise EvolusRequestError("Evolus workflow submission returned invalid JSON.") from exc
+                    if not isinstance(submission, dict):
+                        raise EvolusRequestError("Evolus workflow submission returned an invalid response.")
+                    execution_id = submission.get("executionId")
                 if not isinstance(execution_id, str) or not execution_id:
                     raise EvolusRequestError("Evolus response did not include an execution ID.")
 
@@ -107,7 +118,7 @@ class EvolusAdapter:
                         headers=self._headers(),
                         timeout=min(30.0, max(0.1, deadline - time.monotonic())),
                     )
-                    if response.is_error:
+                    if response.status_code != 200:
                         raise EvolusRequestError(
                             f"Evolus workflow polling returned HTTP {response.status_code}."
                         )
@@ -123,7 +134,9 @@ class EvolusAdapter:
                     if state == "failed":
                         raise EvolusRequestError("Evolus document-extraction workflow failed.")
                     if state == "completed":
-                        result = execution.get("result", execution.get("output"))
+                        result = execution.get("output")
+                        if result is None:
+                            result = execution.get("result")
                         if isinstance(result, str):
                             try:
                                 result = json.loads(result)

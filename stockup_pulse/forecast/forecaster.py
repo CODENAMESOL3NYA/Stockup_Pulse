@@ -36,9 +36,9 @@ class DemandForecaster:
         """
         Calculate deterministic demand forecast, safety stock, and reorder recommendation.
         """
+        if not sales_history:
+            raise ValueError("Sales history is required for a demand forecast.")
         hist = np.array(sales_history, dtype=float)
-        if len(hist) == 0:
-            hist = np.array([2.0, 3.0, 2.5, 4.0, 3.0, 3.5, 4.0])
 
         # Baseline: simple 7-day rolling average
         baseline_daily = float(np.mean(hist[-7:] if len(hist) >= 7 else hist))

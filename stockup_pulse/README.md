@@ -11,14 +11,14 @@ Small retailers and township spaza shops in South Africa operate on thin margins
 **StockUp Pulse** provides:
 1. **Budget-Capped Allocation:** A deterministic greedy allocator caps spending at the owner's Rand budget; it is not a globally optimal integer knapsack solver.
 2. **Brand Substitution:** Substitutions use live scrape records when available, otherwise configured rules or illustrative seed prices. Seed prices are not verified offers.
-3. **Interfaces:** The React dashboard and Streamlit prototype use the Python domain code. Provider-backed leaflet ingestion and WhatsApp delivery are not configured.
+3. **Interfaces:** The React dashboard and Streamlit prototype use the Python domain code. Leaflet extraction is available when AMD or Evolus is fully configured; WhatsApp inbound approval is optional and outbound supplier delivery remains disabled.
 
 ---
 
 ## 🛡️ Non-Negotiable Principles
 
 1. **Money Calculations Are Deterministic:**  
-   Only deterministic Python code computes allocation quantities and totals. External model adapters are currently not configured; local fixture extraction and heuristic matching are labeled as such.
+   Only deterministic Python code computes allocation quantities and totals. External model adapters are optional and disabled by default; local fixture extraction and heuristic matching are labeled as such.
 
 2. **Strict Approval Gate (HTTP 409):**  
    Authenticated API orders require an owner-approved, owner-scoped plan. An unapproved plan returns HTTP 409.
@@ -27,12 +27,12 @@ Small retailers and township spaza shops in South Africa operate on thin margins
    Trace summaries count actual external calls; local heuristics and fixtures do not claim provider calls or fabricated tokens.
 
 4. **Boundary Adapters:**
-   - `adapters/amd_llm.py`: vLLM adapter boundary; remote inference is not configured.
-   - `adapters/evolus.py`: Evolus adapter boundary; provider calls are not configured.  
+   - `adapters/amd_llm.py`: AMD image-extraction adapter; requires an enabled provider and an image-capable configured model.
+   - `adapters/evolus.py`: Evolus workflow adapter; requires the endpoint, API key, application ID, and workflow ID.
    *Business logic never imports openai or Evolus SDKs directly.*
 
 5. **Resilience:**
-   The scraper uses bounded HTTP timeouts and handles common blocks. Provider retry/fallback behavior must be implemented when those integrations are connected.
+   The scraper uses bounded HTTP timeouts and handles common blocks. Provider requests have bounded timeouts and retry transient failures; failures are surfaced rather than treated as successful extraction.
 
 6. **Determinism:**
    The allocator serializes its result with sorted keys and a fixed seed. Database plan IDs and creation timestamps are intentionally outside that deterministic result.
@@ -49,7 +49,6 @@ Small retailers and township spaza shops in South Africa operate on thin margins
 ```
 stockup_pulse/
 ├── .env.example
-├── docker-compose.yml
 ├── requirements.txt
 ├── app/
 │   └── ui/
@@ -71,7 +70,7 @@ stockup_pulse/
 │   └── orchestrator.py             # Restocking agent coordinator
 ├── adapters/
 │   ├── amd_llm.py                  # Model adapter boundary; currently fixture-backed
-│   └── evolus.py                   # Provider boundary; currently not configured
+│   └── evolus.py                   # Optional configured-workflow provider adapter
 ├── orders/
 │   └── manager.py                  # Purchase orders & HTTP 409 approval gate
 ├── trace/
@@ -125,8 +124,5 @@ npm run dev
 streamlit run stockup_pulse/app/ui/streamlit_app.py --server.port 8501
 ```
 
-### 5. Docker Compose
-The current compose file references Dockerfiles that are not included yet; this command will not work until they are added.
-```bash
-docker compose -f stockup_pulse/docker-compose.yml up --build
-```
+### 5. Docker
+Docker deployment is not supported yet: the repository does not include backend or Streamlit Dockerfiles. Run the API and dashboard using the commands above.

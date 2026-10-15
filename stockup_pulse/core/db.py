@@ -4,9 +4,12 @@ Manages the `live_market_prices` table and connections for live retail scraper d
 """
 
 from sqlmodel import SQLModel, Field, create_engine, Session, select
+from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from typing import Optional, List
 from datetime import datetime, timedelta, timezone
 import os
+from pathlib import Path
 import re
 import base64
 import hashlib
@@ -17,7 +20,8 @@ import secrets
 import uuid
 
 # SQLite Database setup
-DB_PATH = os.environ.get("SQLITE_DB_PATH", "stockup_pulse.db")
+DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "stockup_pulse.db"
+DB_PATH = os.environ.get("SQLITE_DB_PATH", str(DEFAULT_DB_PATH))
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(
@@ -74,12 +78,25 @@ class RestockingPlanRecord(SQLModel, table=True):
     created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class FileImportJobRecord(SQLModel, table=True):
+    __tablename__ = "file_import_jobs"
+
+    job_id: str = Field(primary_key=True, default_factory=lambda: str(uuid.uuid4()))
+    owner_id: int = Field(foreign_key="users.id", index=True)
+    status: str = Field(default="processing", index=True)
+    result_json: Optional[str] = None
+    error: Optional[str] = None
+    created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class ApiOrderRecord(SQLModel, table=True):
     __tablename__ = "api_orders"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     owner_id: int = Field(foreign_key="users.id", index=True)
     plan_id: str = Field(foreign_key="restocking_plans.plan_id", index=True)
+    supplier: str
     order_number: str = Field(unique=True, index=True)
     order_json: str
     created_at_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -87,9 +104,78 @@ class ApiOrderRecord(SQLModel, table=True):
 def init_db():
     """Initialize tables, fixture prices, and legacy demo-account cleanup."""
     SQLModel.metadata.create_all(engine)
+    migrate_database()
     seed_baseline_if_empty()
     mark_fixture_prices()
     seed_users_if_empty()
+
+
+def migrate_database() -> None:
+    """Apply versioned SQLite schema migrations without dropping persisted data."""
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(version INTEGER PRIMARY KEY, applied_at_utc TEXT NOT NULL)"
+        )
+        current_version = connection.execute(
+            text("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")
+        ).scalar_one()
+        if current_version >= 1:
+            return
+
+        columns = {column["name"] for column in inspect(connection).get_columns("api_orders")}
+        if "supplier" not in columns:
+            connection.exec_driver_sql(
+                "ALTER TABLE api_orders ADD COLUMN supplier VARCHAR NOT NULL DEFAULT ''"
+            )
+
+        rows = connection.execute(
+            text("SELECT id, order_json, supplier FROM api_orders")
+        ).mappings()
+        for row in rows:
+            supplier = row["supplier"]
+            if not supplier:
+                try:
+                    supplier = json.loads(row["order_json"]).get("supplier")
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"Cannot migrate order {row['id']}: its supplier could not be read."
+                    ) from exc
+                if not isinstance(supplier, str) or not supplier.strip():
+                    raise RuntimeError(
+                        f"Cannot migrate order {row['id']}: its supplier is missing."
+                    )
+                connection.execute(
+                    text("UPDATE api_orders SET supplier = :supplier WHERE id = :id"),
+                    {"supplier": supplier.strip(), "id": row["id"]},
+                )
+
+        duplicates = connection.execute(
+            text(
+                "SELECT owner_id, plan_id, supplier, COUNT(*) AS order_count "
+                "FROM api_orders GROUP BY owner_id, plan_id, supplier "
+                "HAVING COUNT(*) > 1 LIMIT 1"
+            )
+        ).first()
+        if duplicates:
+            raise RuntimeError(
+                "Cannot enforce order idempotency: duplicate orders already exist for "
+                f"plan {duplicates.plan_id!r} and supplier {duplicates.supplier!r}. "
+                "Review these records before restarting."
+            )
+
+        connection.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_api_orders_owner_plan_supplier ON api_orders(owner_id, plan_id, supplier)"
+        )
+        connection.execute(
+            text(
+                "INSERT INTO schema_migrations (version, applied_at_utc) "
+                "VALUES (1, :applied_at_utc)"
+            ),
+            {"applied_at_utc": datetime.now(timezone.utc).isoformat()},
+        )
+
 
 def normalize_phone(phone: str) -> str:
     """Normalize South African phone formats to digits-only."""
@@ -188,6 +274,53 @@ def get_user_for_token(token: str) -> Optional[User]:
         if not auth_session or datetime.fromisoformat(auth_session.expires_at_utc) <= now:
             return None
         return session.get(User, auth_session.owner_id)
+
+
+def create_file_import_job(owner_id: int) -> str:
+    record = FileImportJobRecord(owner_id=owner_id)
+    with Session(engine) as session:
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return record.job_id
+
+
+def update_file_import_job(
+    job_id: str,
+    status: str,
+    result: Optional[dict] = None,
+    error: Optional[str] = None,
+) -> None:
+    with Session(engine) as session:
+        record = session.get(FileImportJobRecord, job_id)
+        if record is None:
+            raise RuntimeError(f"File import job {job_id!r} no longer exists.")
+        record.status = status
+        record.result_json = json.dumps(result, sort_keys=True) if result is not None else None
+        record.error = error
+        record.updated_at_utc = datetime.now(timezone.utc).isoformat()
+        session.add(record)
+        session.commit()
+
+
+def get_file_import_job(owner_id: int, job_id: str) -> Optional[dict]:
+    with Session(engine) as session:
+        record = session.exec(
+            select(FileImportJobRecord).where(
+                FileImportJobRecord.job_id == job_id,
+                FileImportJobRecord.owner_id == owner_id,
+            )
+        ).first()
+        if record is None:
+            return None
+        return {
+            "job_id": record.job_id,
+            "status": record.status,
+            "result": json.loads(record.result_json) if record.result_json else None,
+            "error": record.error,
+            "created_at_utc": record.created_at_utc,
+            "updated_at_utc": record.updated_at_utc,
+        }
 
 
 def get_user_for_whatsapp_number(phone: str) -> Optional[User]:
@@ -291,32 +424,48 @@ def save_orders_for_plan(owner_id: int, plan_id: str, orders: list[dict]) -> lis
         manager = PurchaseOrderManager()
         saved_orders = []
         order_year = datetime.now(timezone.utc).year
-        for order in orders:
-            record = ApiOrderRecord(
-                owner_id=owner_id,
-                plan_id=plan_id,
-                order_number=f"pending-{uuid.uuid4()}",
-                order_json="{}"
-            )
-            session.add(record)
-            session.flush()
-            order_number = f"PO-{order_year}-{record.id:06d}"
-            order["order_number"] = order_number
-            order["whatsapp_message"] = manager.format_whatsapp_message(
-                order_number,
-                order["supplier"],
-                order["store_name"],
-                {
-                    "items": order["items"],
-                    "total_spend": order["total_spend"],
-                }
-            )
-            order["delivery_status"] = "not_sent"
-            record.order_number = order_number
-            record.order_json = json.dumps(order, sort_keys=True)
-            session.add(record)
-            saved_orders.append(order)
-        session.commit()
+        try:
+            for order in orders:
+                supplier = str(order.get("supplier") or "").strip()
+                if not supplier:
+                    raise ValueError("Every purchase order must include a supplier.")
+                record = ApiOrderRecord(
+                    owner_id=owner_id,
+                    plan_id=plan_id,
+                    supplier=supplier,
+                    order_number=f"pending-{uuid.uuid4()}",
+                    order_json="{}"
+                )
+                session.add(record)
+                session.flush()
+                order_number = f"PO-{order_year}-{record.id:06d}"
+                order["order_number"] = order_number
+                order["whatsapp_message"] = manager.format_whatsapp_message(
+                    order_number,
+                    supplier,
+                    order["store_name"],
+                    {
+                        "items": order["items"],
+                        "total_spend": order["total_spend"],
+                    }
+                )
+                order["delivery_status"] = "not_sent"
+                record.order_number = order_number
+                record.order_json = json.dumps(order, sort_keys=True)
+                session.add(record)
+                saved_orders.append(order)
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            existing = session.exec(
+                select(ApiOrderRecord).where(
+                    ApiOrderRecord.owner_id == owner_id,
+                    ApiOrderRecord.plan_id == plan_id,
+                ).order_by(ApiOrderRecord.id)
+            ).all()
+            if existing:
+                return [json.loads(record.order_json) for record in existing]
+            raise
         return saved_orders
 
 
@@ -383,7 +532,7 @@ def seed_baseline_if_empty():
                 product_name="Jive Carbonated Soda 440ml",
                 price_zar=7.50,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Checkers",
@@ -391,7 +540,7 @@ def seed_baseline_if_empty():
                 product_name="Twizza Carbonated Soft Drink 500ml",
                 price_zar=7.00,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Makro",
@@ -399,7 +548,7 @@ def seed_baseline_if_empty():
                 product_name="Sparletta Creme Soda 440ml",
                 price_zar=8.20,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             # Cooking Oil
             LiveMarketPrice(
@@ -408,7 +557,7 @@ def seed_baseline_if_empty():
                 product_name="Sunfoil Sunflower Cooking Oil 750ml",
                 price_zar=24.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Makro",
@@ -416,7 +565,7 @@ def seed_baseline_if_empty():
                 product_name="D'lite Cooking Oil 6x1L",
                 price_zar=149.00,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Checkers",
@@ -424,7 +573,7 @@ def seed_baseline_if_empty():
                 product_name="Housebrand Pure Sunflower Oil 1L",
                 price_zar=29.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             # Maize Meal
             LiveMarketPrice(
@@ -433,7 +582,7 @@ def seed_baseline_if_empty():
                 product_name="White Star Super Maize Meal 2.5kg",
                 price_zar=36.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Makro",
@@ -441,7 +590,7 @@ def seed_baseline_if_empty():
                 product_name="Ace Super Maize Meal 5kg",
                 price_zar=59.00,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             # Sugar
             LiveMarketPrice(
@@ -450,7 +599,7 @@ def seed_baseline_if_empty():
                 product_name="Huletts White Sugar 2.5kg",
                 price_zar=54.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Checkers",
@@ -458,7 +607,7 @@ def seed_baseline_if_empty():
                 product_name="Housebrand White Sugar 2.5kg",
                 price_zar=48.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             # Rice
             LiveMarketPrice(
@@ -467,7 +616,7 @@ def seed_baseline_if_empty():
                 product_name="Tastic Long Grain Parboiled Rice 2kg",
                 price_zar=42.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Makro",
@@ -475,7 +624,7 @@ def seed_baseline_if_empty():
                 product_name="Spekko Long Grain Parboiled Rice 2kg",
                 price_zar=36.50,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             # Bakery / Brown Bread
             LiveMarketPrice(
@@ -484,7 +633,7 @@ def seed_baseline_if_empty():
                 product_name="Sunbake Sliced Brown Bread 700g",
                 price_zar=15.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Pick n Pay",
@@ -492,7 +641,7 @@ def seed_baseline_if_empty():
                 product_name="Sasko Premium Brown Bread 700g",
                 price_zar=16.49,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             # Milk
             LiveMarketPrice(
@@ -501,7 +650,7 @@ def seed_baseline_if_empty():
                 product_name="Crystal Valley Long Life Milk 6x1L",
                 price_zar=79.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             ),
             LiveMarketPrice(
                 retailer="Checkers",
@@ -509,7 +658,7 @@ def seed_baseline_if_empty():
                 product_name="First Choice Full Cream UHT Milk 6x1L",
                 price_zar=89.99,
                 availability="InStock",
-                source_type="verified_seed"
+                source_type="demo_fixture"
             )
         ]
 

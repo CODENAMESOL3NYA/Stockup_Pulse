@@ -177,6 +177,13 @@ export interface FileImportReview {
   providers: Record<string, { enabled: boolean }>;
 }
 
+export interface FileImportJobStatus {
+  job_id: string;
+  status: 'processing' | 'completed' | 'failed';
+  result?: FileImportReview;
+  error?: string;
+}
+
 export interface ProviderCapabilities {
   amd_image_extraction: { enabled: boolean };
   evolus_pdf_extraction: { enabled: boolean };

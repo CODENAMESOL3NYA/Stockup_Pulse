@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -149,13 +150,22 @@ def test_plan_approval_and_orders_are_owner_scoped_and_persistent(client):
         headers=auth(owner_token),
     )
     assert approved.status_code == 200
-    created = client.post(
-        "/api/orders",
-        json={"approved": True, "plan_id": plan_id, "store_name": "Test Shop"},
-        headers=auth(owner_token),
-    )
-    assert created.status_code == 200
-    order_numbers = [order["order_number"] for order in created.json()["orders"]]
+    def create_orders(_):
+        return client.post(
+            "/api/orders",
+            json={"approved": True, "plan_id": plan_id, "store_name": "Test Shop"},
+            headers=auth(owner_token),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        concurrent_responses = list(executor.map(create_orders, range(2)))
+    assert [response.status_code for response in concurrent_responses] == [200, 200]
+    order_numbers = [
+        order["order_number"] for order in concurrent_responses[0].json()["orders"]
+    ]
+    assert [
+        order["order_number"] for order in concurrent_responses[1].json()["orders"]
+    ] == order_numbers
     repeated = client.post(
         "/api/orders",
         json={"approved": True, "plan_id": plan_id, "store_name": "Test Shop"},
@@ -353,8 +363,12 @@ def test_file_import_returns_review_candidates_without_saving_a_plan(client, mon
         ],
     )
 
-    assert response.status_code == 200
-    candidate = response.json()["candidates"][0]
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    job_response = client.get(f"/api/plan/from-files/{job_id}", headers=auth(token))
+    assert job_response.status_code == 200
+    assert job_response.json()["status"] == "completed"
+    candidate = job_response.json()["result"]["candidates"][0]
     assert candidate["unit_price"] == 10
     assert candidate["sales_history"] == [4]
     assert candidate["lead_time_days"] == 2
@@ -383,6 +397,72 @@ def test_file_import_provider_failure_returns_no_partial_review(client, monkeypa
         ],
     )
 
-    assert response.status_code == 502
-    assert "sensitive provider detail" not in response.text
+    assert response.status_code == 202
+    job = client.get(
+        f"/api/plan/from-files/{response.json()['job_id']}",
+        headers=auth(token),
+    ).json()
+    assert job["status"] == "failed"
+    assert "sensitive provider detail" not in job["error"]
     assert database.get_plan_for_user(user_id) is None
+
+
+def test_file_import_reports_sanitized_evolus_status(client, monkeypatch):
+    token, user_id = register(client, "+27820000016")
+    monkeypatch.setattr(api.settings, "EVOLUS_ENABLED", True)
+    monkeypatch.setattr(api.settings, "EVOLUS_API_KEY", "test-key")
+    monkeypatch.setattr(api.settings, "EVOLUS_APPLICATION_ID", "test-app-id")
+    monkeypatch.setattr(api.settings, "EVOLUS_WORKFLOW_ID", "test-workflow-id")
+
+    def fail_extraction(content, filename):
+        raise api.EvolusRequestError("Evolus workflow submission returned HTTP 409.")
+
+    monkeypatch.setattr(api.leaflet_extractor, "extract_structured_from_leaflet", fail_extraction)
+    response = client.post(
+        "/api/plan/from-files",
+        headers=auth(token),
+        files=[
+            ("files", ("sales.csv", b"date,product,quantity_sold\n2025-03-01,Milk 1L,4\n", "text/csv")),
+            ("files", ("stock.csv", b"product,current_stock\nMilk 1L,2\n", "text/csv")),
+            ("files", ("supplier_promo_flyers.pdf", b"%PDF-fixture", "application/pdf")),
+        ],
+    )
+
+    assert response.status_code == 202
+    job = client.get(
+        f"/api/plan/from-files/{response.json()['job_id']}",
+        headers=auth(token),
+    ).json()
+    assert job["status"] == "failed"
+    assert job["error"] == "supplier_promo_flyers.pdf: Evolus workflow submission returned HTTP 409."
+    assert database.get_plan_for_user(user_id) is None
+
+
+def test_file_import_job_is_private_to_its_owner(client, monkeypatch):
+    token, _ = register(client, "+27820000017")
+    other_token, _ = register(client, "+27820000018")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_ENABLED", True)
+    monkeypatch.setattr(api.settings, "AMD_ROCM_HOST", "https://amd.example/v1")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_API_KEY", "test-key")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_MODEL", "vision-model")
+    monkeypatch.setattr(
+        api.leaflet_extractor,
+        "extract_structured_from_leaflet",
+        lambda content, filename: {"source": "amd", "extracted_items": []},
+    )
+
+    response = client.post(
+        "/api/plan/from-files",
+        headers=auth(token),
+        files=[
+            ("files", ("sales.csv", b"date,product,quantity_sold\n2025-03-01,Milk 1L,4\n", "text/csv")),
+            ("files", ("stock.csv", b"product,current_stock\nMilk 1L,2\n", "text/csv")),
+            ("files", ("offer.jpg", b"fake image bytes", "image/jpeg")),
+        ],
+    )
+
+    status = client.get(
+        f"/api/plan/from-files/{response.json()['job_id']}",
+        headers=auth(other_token),
+    )
+    assert status.status_code == 404

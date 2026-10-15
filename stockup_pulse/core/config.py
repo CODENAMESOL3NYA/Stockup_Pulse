@@ -3,8 +3,11 @@ StockUp Pulse - Core Configuration
 AMD Hackathon ACT III (Track: Reinvent Commerce)
 """
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
+
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
     # Application Info
@@ -23,10 +26,16 @@ class Settings(BaseSettings):
     # Evolus Building Blocks
     EVOLUS_ENABLED: bool = False
     EVOLUS_API_KEY: str = ""
-    EVOLUS_APPLICATION_ID: str = ""
-    EVOLUS_WORKFLOW_ID: str = ""
+    EVOLUS_APPLICATION_ID: str = Field(
+        default="",
+        validation_alias=AliasChoices("EVOLUS_APPLICATION_ID", "EVOLUS_APP_ID"),
+    )
+    EVOLUS_WORKFLOW_ID: str = Field(
+        default="",
+        validation_alias=AliasChoices("EVOLUS_WORKFLOW_ID", "WORKFLOW_ID"),
+    )
     EVOLUS_ENDPOINT: str = "https://api.evolus.ai/api/v1"
-    EVOLUS_EXECUTION_TIMEOUT_SECONDS: float = 120.0
+    EVOLUS_EXECUTION_TIMEOUT_SECONDS: float = 600.0
     EVOLUS_POLL_INTERVAL_SECONDS: float = 2.0
     
     # WhatsApp / Twilio

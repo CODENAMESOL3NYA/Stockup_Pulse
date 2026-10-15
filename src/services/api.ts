@@ -5,6 +5,7 @@ import {
   WapeMetrics,
   AuthUser,
   FileImportReview,
+  FileImportJobStatus,
   ImportForecast,
   ProviderCapabilities
 } from '../types';
@@ -105,9 +106,29 @@ export async function uploadPlanningFiles(
     headers: authenticatedHeaders(),
     body
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.detail || `File import failed: ${res.status}`);
-  return data as FileImportReview;
+  const accepted = await res.json();
+  if (!res.ok) throw new Error(accepted.detail || `File import failed: ${res.status}`);
+  if (typeof accepted.job_id !== 'string') throw new Error('File import did not return a job ID.');
+
+  const deadline = Date.now() + 11 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => window.setTimeout(resolve, 2000));
+    const statusResponse = await fetch(
+      `${API_BASE}/plan/from-files/${encodeURIComponent(accepted.job_id)}`,
+      { headers: authenticatedHeaders() }
+    );
+    const job = await statusResponse.json() as FileImportJobStatus & { detail?: string };
+    if (!statusResponse.ok) {
+      throw new Error(job.detail || `File import status failed: ${statusResponse.status}`);
+    }
+    if (job.status === 'completed' && job.result) return job.result;
+    if (job.status === 'failed') {
+      throw new Error(job.error || 'File extraction failed. Please retry the upload.');
+    }
+    if (job.status !== 'processing') throw new Error('File import returned an unknown job status.');
+  }
+
+  throw new Error(`File extraction is still processing (job ${accepted.job_id}). Please retry the status check.`);
 }
 
 export async function forecastImportedCandidate(

@@ -78,6 +78,8 @@ Open `http://localhost:3000`. The FastAPI service is at `http://127.0.0.1:8000`;
 
 Account registration is required. The old hard-coded demo account and demo login fallback are disabled.
 
+File imports return an authenticated job ID immediately; the dashboard polls `/api/plan/from-files/{job_id}` for extraction completion, so the browser and Express proxy do not have to hold the upload request open while Evolus runs. Evolus execution polling is bounded by `EVOLUS_EXECUTION_TIMEOUT_SECONDS` (default 600 seconds).
+
 To run the Streamlit prototype instead or alongside the API:
 
 ```powershell
@@ -107,9 +109,11 @@ Provider integrations are off by default. To enable them, set the corresponding 
 | Evolus PDF extraction | `EVOLUS_ENABLED`, `EVOLUS_ENDPOINT`, `EVOLUS_API_KEY`, `EVOLUS_APPLICATION_ID`, and `EVOLUS_WORKFLOW_ID` |
 | Twilio inbound webhook | `TWILIO_WEBHOOK_ENABLED`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and the externally reachable canonical `TWILIO_WEBHOOK_PUBLIC_URL` |
 
-For Evolus, copy the application ID and workflow ID for the document-extraction workflow from your Evolus setup into `stockup_pulse/.env`; setting only `EVOLUS_ENABLED=true` and an API key is not sufficient. Restart the FastAPI process after changing this file, then confirm `evolus_pdf_extraction.enabled` is `true` from `http://127.0.0.1:8000/api/providers`.
+For Evolus, copy the application ID and workflow ID for the document-extraction workflow from your Evolus setup into `stockup_pulse/.env`; setting only `EVOLUS_ENABLED=true` and an API key is not sufficient. The app accepts both `EVOLUS_APPLICATION_ID` / `EVOLUS_WORKFLOW_ID` and the Evolus sample names `EVOLUS_APP_ID` / `WORKFLOW_ID`. The workflow ID must identify the extraction workflow and must not be substituted with the application ID. Restart the FastAPI process after changing this file, then confirm `evolus_pdf_extraction.enabled` is `true` from `http://127.0.0.1:8000/api/providers`.
 
 `AMD_ROCM_MODEL` has no default: the configured preference must exist in AMD's live model catalog and explicitly support image input. The backend environment example lists the supplied model IDs, but catalog availability and capability must be checked at runtime. `OUTBOUND_SUPPLIER_DISPATCH_ENABLED` is intentionally disabled; supplier recipients and opt-ins are not configured. Never put actual API keys in source control, issue reports, or chat.
+
+The default SQLite database is stored at the repository root as `stockup_pulse.db`, regardless of the process working directory. Set `SQLITE_DB_PATH` to use another location. Startup applies additive schema migrations; backups are recommended before deploying updates to databases with existing order records.
 
 ### File import formats
 
@@ -136,4 +140,4 @@ Uploaded leaflet items require owner review of product mapping, pack/unit cost, 
 
 ## Docker
 
-The current `stockup_pulse/docker-compose.yml` references `Dockerfile.api` and `Dockerfile.streamlit`, which are not present yet. Docker Compose will not run until those Dockerfiles are added.
+Docker deployment is not supported yet because the repository does not include backend or Streamlit Dockerfiles. Run the API and dashboard using the commands above.

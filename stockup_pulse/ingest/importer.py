@@ -12,6 +12,13 @@ from typing import Any, Dict, Iterable, Tuple
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
+XLSX_MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+XLSX_MAX_MEMBERS = 256
+XLSX_MAX_SHEETS = 10
+XLSX_MAX_ROWS = 100_000
+XLSX_MAX_COLUMNS = 100
+XLSX_MAX_CELLS = 1_000_000
+
 
 class ImportValidationError(ValueError):
     """Raised when an uploaded sales or stock file violates the import contract."""
@@ -58,26 +65,62 @@ def _records_from_csv(content: bytes) -> list[dict[str, Any]]:
 
 def _records_from_xlsx(content: bytes) -> dict[str, list[dict[str, Any]]]:
     try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            if len(members) > XLSX_MAX_MEMBERS:
+                raise ImportValidationError("XLSX contains too many internal files.")
+            total_uncompressed = sum(member.file_size for member in members)
+            if total_uncompressed > XLSX_MAX_UNCOMPRESSED_BYTES:
+                raise ImportValidationError("XLSX expands beyond the 100 MiB processing limit.")
+            if any(member.flag_bits & 0x1 for member in members):
+                raise ImportValidationError("Encrypted XLSX files are not supported.")
+            if any(
+                member.file_size > 0
+                and (member.compress_size == 0 or member.file_size / member.compress_size > 1000)
+                for member in members
+            ):
+                raise ImportValidationError("XLSX contains an unsafe compression ratio.")
         workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    except ImportValidationError:
+        raise
     except (InvalidFileException, OSError, ValueError, zipfile.BadZipFile) as exc:
         raise ImportValidationError("XLSX file could not be read.") from exc
     result: dict[str, list[dict[str, Any]]] = {}
     try:
+        if len(workbook.sheetnames) > XLSX_MAX_SHEETS:
+            raise ImportValidationError("XLSX contains too many worksheets.")
         for sheet_name in ("sales", "stock"):
             if sheet_name not in workbook.sheetnames:
                 continue
             sheet = workbook[sheet_name]
+            if (
+                (sheet.max_row is not None and sheet.max_row > XLSX_MAX_ROWS)
+                or (sheet.max_column is not None and sheet.max_column > XLSX_MAX_COLUMNS)
+            ):
+                raise ImportValidationError(
+                    f"XLSX sheet '{sheet_name}' exceeds the row or column processing limit."
+                )
             values = sheet.iter_rows(values_only=True)
             header_row = next(values, None)
             if not header_row:
                 raise ImportValidationError(f"XLSX sheet '{sheet_name}' is empty.")
+            if len(header_row) > XLSX_MAX_COLUMNS:
+                raise ImportValidationError(f"XLSX sheet '{sheet_name}' has too many columns.")
             headers = [str(value).strip().lower() if value is not None else "" for value in header_row]
             if not all(headers) or len(set(headers)) != len(headers):
                 raise ImportValidationError(f"XLSX sheet '{sheet_name}' headers must be present and unique.")
             data_rows = []
-            for cells in values:
+            parsed_cells = len(header_row)
+            for row_number, cells in enumerate(values, start=2):
+                if row_number > XLSX_MAX_ROWS:
+                    raise ImportValidationError(f"XLSX sheet '{sheet_name}' has too many rows.")
+                if len(cells) > XLSX_MAX_COLUMNS:
+                    raise ImportValidationError(f"XLSX sheet '{sheet_name}' has too many columns.")
                 if not any(value is not None and str(value).strip() for value in cells):
                     continue
+                parsed_cells += len(cells)
+                if parsed_cells > XLSX_MAX_CELLS:
+                    raise ImportValidationError(f"XLSX sheet '{sheet_name}' has too many cells.")
                 data_rows.append({
                     key: cells[index] if index < len(cells) else None
                     for index, key in enumerate(headers)

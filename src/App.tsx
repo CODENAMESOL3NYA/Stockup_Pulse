@@ -48,6 +48,7 @@ export default function App() {
   const [isApproved, setIsApproved] = useState<boolean>(false);
   const [isSubmittingApproval, setIsSubmittingApproval] = useState<boolean>(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  const [planError, setPlanError] = useState<string | null>(null);
 
   // Initial catalogue items matching mockup exactly
   const [products, setProducts] = useState<ProductItem[]>([
@@ -156,9 +157,22 @@ export default function App() {
     if (currentUser) fetchWapeMetrics().then(setWapeMetrics);
   }, [currentUser]);
 
-  const recomputePlan = async (currentBudget: number, horizon: number, items: ProductItem[], allowSubs = true) => {
-    const newPlan = await generatePlan(currentBudget, horizon, items, allowSubs);
-    setPlan(newPlan);
+  const recomputePlan = async (
+    currentBudget: number,
+    horizon: number,
+    items: ProductItem[],
+    allowSubs = true
+  ): Promise<boolean> => {
+    setPlanError(null);
+    try {
+      const newPlan = await generatePlan(currentBudget, horizon, items, allowSubs);
+      setPlan(newPlan);
+      return true;
+    } catch (error) {
+      setPlan(null);
+      setPlanError(error instanceof Error ? error.message : 'Plan generation failed.');
+      return false;
+    }
   };
 
   const handleUpdateProduct = (updated: ProductItem) => {
@@ -175,7 +189,9 @@ export default function App() {
   ): Promise<FileImportReview | null> => {
     if (!files.length) {
       if (!useDemoData) throw new Error('Upload sales, stock, and leaflet files or enable demo data.');
-      await recomputePlan(budget, planningHorizon, products);
+      if (!(await recomputePlan(budget, planningHorizon, products))) {
+        throw new Error('Plan generation failed. Review the error message and try again.');
+      }
       setCurrentStep(2);
       setCurrentTab('catalogue');
       setMaxStepReached(prev => Math.max(prev, 2));
@@ -189,7 +205,8 @@ export default function App() {
     }
   };
 
-  const handleImportCandidates = (candidates: FileImportCandidate[]) => {
+  const handleImportCandidates = async (candidates: FileImportCandidate[]) => {
+    setIsProcessing(true);
     const imported: ProductItem[] = candidates.map((candidate, index) => ({
       id: `import-${candidate.id}-${index}`,
       product: candidate.matched_product,
@@ -211,11 +228,15 @@ export default function App() {
       currency: candidate.currency || '',
       currency_verified: candidate.currency_verified === true
     }));
-    setProducts(imported);
-    void recomputePlan(budget, horizonDays, imported);
-    setCurrentStep(2);
-    setCurrentTab('catalogue');
-    setMaxStepReached(prev => Math.max(prev, 2));
+    try {
+      if (!(await recomputePlan(budget, horizonDays, imported))) return;
+      setProducts(imported);
+      setCurrentStep(2);
+      setCurrentTab('catalogue');
+      setMaxStepReached(prev => Math.max(prev, 2));
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const handleSimulateStockoutSub = () => {
@@ -375,6 +396,11 @@ export default function App() {
 
         {/* View Switcher / Page Body */}
         <main className="flex-1 overflow-y-auto">
+          {planError && (
+            <div role="alert" className="mx-6 mt-4 border border-[#FF3333] bg-[#2A1111] p-3 text-sm text-[#FF7777]">
+              Plan generation failed: {planError}
+            </div>
+          )}
           {currentTab === 'home' && (
             <HomeHero
               onGetStarted={() => {

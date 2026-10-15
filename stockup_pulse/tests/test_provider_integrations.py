@@ -13,9 +13,40 @@ from stockup_pulse.adapters.amd_llm import (
 )
 from stockup_pulse.adapters.evolus import EvolusAdapter, EvolusRequestError
 from stockup_pulse.api.main import PlanRequest, _parse_lead_times
-from stockup_pulse.core.config import settings
+from stockup_pulse.core.config import Settings, settings
+from stockup_pulse.ingest.extract.leaflet_extractor import LeafletExtractor
 from fastapi import HTTPException
 from stockup_pulse.trace.tracker import trace_collector
+
+
+def test_evolus_settings_accept_sample_environment_variable_names(monkeypatch):
+    monkeypatch.setenv("EVOLUS_APP_ID", "sample-app-id")
+    monkeypatch.setenv("WORKFLOW_ID", "sample-workflow-id")
+
+    configured = Settings(_env_file=None)
+
+    assert configured.EVOLUS_APPLICATION_ID == "sample-app-id"
+    assert configured.EVOLUS_WORKFLOW_ID == "sample-workflow-id"
+
+
+def test_leaflet_extractor_routes_pdf_and_supplies_observed_only_prompt(monkeypatch):
+    calls = []
+
+    def extract_document(content, filename, prompt):
+        calls.append((content, filename, prompt))
+        return {"extracted_items": [], "source": "evolus"}
+
+    monkeypatch.setattr(
+        "stockup_pulse.ingest.extract.leaflet_extractor.evolus_adapter.extract_document",
+        extract_document,
+    )
+
+    result = LeafletExtractor().extract_structured_from_leaflet(b"%PDF-fixture", "leaflet.pdf")
+
+    assert result["source"] == "evolus"
+    assert calls[0][0:2] == (b"%PDF-fixture", "leaflet.pdf")
+    assert "Do not estimate prices" in calls[0][2]
+    assert "order quantities" in calls[0][2]
 
 
 def test_amd_discovers_vision_model_and_sends_base64_image(monkeypatch):
@@ -156,7 +187,7 @@ def test_evolus_submits_and_polls_configured_workflow(monkeypatch):
             calls.append(("POST", url, kwargs))
             return SimpleNamespace(
                 status_code=202,
-                headers={},
+                headers={"X-Workflow-Execution-Id": "execution-1"},
                 json=lambda: {"executionId": "execution-1"},
             )
 
@@ -164,24 +195,33 @@ def test_evolus_submits_and_polls_configured_workflow(monkeypatch):
             calls.append(("GET", url, kwargs))
             self.poll += 1
             state = ["Pending", "Running", "Completed"][self.poll - 1]
-            result = {"items": [{"product": "Rice", "pack_price": 20, "supplier": "Makro"}]}
+            output = json.dumps({
+                "extracted_items": [{"product": "Rice", "pack_price": 20, "supplier": "Makro"}]
+            })
             return SimpleNamespace(
                 is_error=False,
                 status_code=200,
-                json=lambda: {"status": state, "result": result},
+                json=lambda: {"status": state, "output": output},
             )
 
     monkeypatch.setattr("stockup_pulse.adapters.evolus.httpx.Client", FakeClient)
     monkeypatch.setattr("stockup_pulse.adapters.evolus.time.sleep", lambda _: None)
 
-    result = EvolusAdapter().extract_document(b"%PDF-fixture", "leaflet.pdf")
+    result = EvolusAdapter().extract_document(
+        b"%PDF-fixture",
+        "leaflet.pdf",
+        "Return JSON with extracted_items; do not estimate.",
+    )
 
     assert result["status"] == "completed"
     assert result["extracted_items"][0]["product"] == "Rice"
     assert len(calls) == 4
-    assert "workflows/leaflet-workflow/execute" in calls[0][1]
+    assert calls[0][1] == "https://api.evolus.ai/api/v1/workflows/leaflet-workflow/execute"
+    assert calls[0][2]["headers"]["X-ApiKey"] == "test-api-key"
     assert calls[0][2]["headers"]["X-Application-Id"] == "test-app"
+    assert calls[0][2]["data"]["input"] == "Return JSON with extracted_items; do not estimate."
     assert calls[0][2]["files"]["file"][1] == b"%PDF-fixture"
+    assert calls[1][1].endswith("/executions/execution-1")
 
 
 def test_evolus_failed_execution_is_reported_without_result(monkeypatch):
@@ -240,7 +280,7 @@ def test_evolus_malformed_completed_result_fails_validation(monkeypatch):
             return SimpleNamespace(
                 is_error=False,
                 status_code=200,
-                json=lambda: {"status": "Completed", "result": {"items": "not-an-array"}},
+                json=lambda: {"status": "Completed", "output": '{"extracted_items": "not-an-array"}'},
             )
 
     monkeypatch.setattr("stockup_pulse.adapters.evolus.httpx.Client", FakeClient)
@@ -248,6 +288,45 @@ def test_evolus_malformed_completed_result_fails_validation(monkeypatch):
 
     with pytest.raises(EvolusRequestError, match="invalid candidate structure"):
         EvolusAdapter().extract_document(b"%PDF-fixture", "leaflet.pdf")
+
+
+def test_evolus_uses_execution_header_when_submission_body_is_empty(monkeypatch):
+    monkeypatch.setattr(settings, "EVOLUS_ENABLED", True)
+    monkeypatch.setattr(settings, "EVOLUS_API_KEY", "test-api-key")
+    monkeypatch.setattr(settings, "EVOLUS_APPLICATION_ID", "test-app")
+    monkeypatch.setattr(settings, "EVOLUS_WORKFLOW_ID", "leaflet-workflow")
+    monkeypatch.setattr(settings, "EVOLUS_EXECUTION_TIMEOUT_SECONDS", 10)
+    monkeypatch.setattr(settings, "EVOLUS_POLL_INTERVAL_SECONDS", 0.01)
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def post(self, *args, **kwargs):
+            return SimpleNamespace(
+                status_code=202,
+                headers={"X-Workflow-Execution-Id": "execution-from-header"},
+                json=lambda: (_ for _ in ()).throw(ValueError("empty response body")),
+            )
+
+        def get(self, *args, **kwargs):
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"status": "Completed", "output": '{"extracted_items": []}'},
+            )
+
+    monkeypatch.setattr("stockup_pulse.adapters.evolus.httpx.Client", FakeClient)
+    monkeypatch.setattr("stockup_pulse.adapters.evolus.time.sleep", lambda _: None)
+
+    result = EvolusAdapter().extract_document(b"%PDF-fixture", "leaflet.pdf")
+
+    assert result["extracted_items"] == []
 
 
 def test_evolus_pending_execution_respects_deadline(monkeypatch):

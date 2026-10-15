@@ -15,7 +15,7 @@ interface Step1UploadProps {
     horizonDays: number,
     demoData: boolean
   ) => Promise<FileImportReview | null>;
-  onImportCandidates: (candidates: FileImportCandidate[]) => void;
+  onImportCandidates: (candidates: FileImportCandidate[]) => Promise<void> | void;
   isProcessing: boolean;
 }
 
@@ -416,7 +416,7 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
               ))}
               <button
                 type="button"
-                disabled={!canImport}
+                disabled={!canImport || isProcessing}
                 onClick={() => onImportCandidates(includedCandidates)}
                 className="w-full py-3 bg-[#E50000] disabled:bg-[#444444] text-white text-xs font-bold uppercase rounded-[4px]"
               >
@@ -505,6 +505,11 @@ export const Step1Upload: React.FC<Step1UploadProps> = ({
           >
             {isProcessing || isReviewing ? 'PROCESSING FILES...' : uploadedFiles.length ? 'UPLOAD & EXTRACT' : 'CONTINUE'}
           </button>
+          {(isProcessing || isReviewing) && (
+            <p role="status" className="text-[11px] text-[#999999]">
+              Provider extraction can take several minutes. Keep this page open while the import status is checked.
+            </p>
+          )}
         </div>
       </div>
     </div>

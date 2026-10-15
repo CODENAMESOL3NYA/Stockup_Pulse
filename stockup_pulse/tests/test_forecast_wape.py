@@ -4,6 +4,7 @@ Ensures honest and transparent reporting of Model WAPE vs Baseline WAPE.
 """
 
 import numpy as np
+import pytest
 from stockup_pulse.forecast.forecaster import calculate_wape, DemandForecaster
 
 def test_wape_calculation():
@@ -25,3 +26,8 @@ def test_forecaster_transparency():
     assert eval_res["forecast_accuracy"] > eval_res["baseline_accuracy"]
     assert eval_res["dataset_type"] == "illustrative_fixture"
     assert eval_res["sample_count"] == 10
+
+
+def test_forecaster_requires_real_sales_history():
+    with pytest.raises(ValueError, match="Sales history is required"):
+        DemandForecaster().forecast_item([], lead_time_days=3)

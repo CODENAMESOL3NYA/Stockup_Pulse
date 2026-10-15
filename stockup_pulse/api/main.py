@@ -14,11 +14,12 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import math
 import re
 from xml.sax.saxutils import escape
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
@@ -64,9 +65,14 @@ from stockup_pulse.core.db import (
     get_orders_for_plan,
     get_latest_pending_plan_for_user,
     get_user_for_whatsapp_number,
+    create_file_import_job,
+    get_file_import_job,
+    update_file_import_job,
 )
 from stockup_pulse.app.ingest.live_scraper import live_retail_scraper
 from sqlmodel import Session, select
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -370,67 +376,14 @@ def provider_status():
     return _provider_capabilities()
 
 
-@app.post("/api/plan/from-files")
-async def create_import_review(
-    files: List[UploadFile] = File(...),
-    supplier_lead_times_json: str = Form(default="{}"),
-    planning_horizon_days: int = Form(default=14, ge=1, le=365),
-    user: User = Depends(require_user),
-):
-    """Parse local sales/stock inputs and extract leaflets for owner review."""
-    del user
-    if not files or len(files) > settings.MAX_UPLOAD_FILES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Upload between 1 and {settings.MAX_UPLOAD_FILES} files.",
-        )
-
-    lead_times = {
-        str(supplier).casefold().strip(): days
-        for supplier, days in settings.SUPPLIER_LEAD_TIMES.items()
-    }
-    lead_times.update(_parse_lead_times(supplier_lead_times_json))
-    file_contents: List[tuple[str, str, bytes]] = []
-    total_bytes = 0
-    tabular_files: List[tuple[str, bytes]] = []
-    leaflet_files: List[tuple[str, str, bytes]] = []
-
-    for index, upload in enumerate(files, start=1):
-        original_name = upload.filename or f"upload-{index}"
-        filename = re.split(r"[/\\]", original_name)[-1][:255]
-        suffix = filename.rsplit(".", 1)[-1].casefold() if "." in filename else ""
-        if suffix not in {"csv", "xlsx", "pdf", "jpg", "jpeg", "png"}:
-            raise HTTPException(status_code=415, detail=f"{filename}: unsupported file type.")
-        content = await upload.read(settings.MAX_UPLOAD_FILE_BYTES + 1)
-        if len(content) > settings.MAX_UPLOAD_FILE_BYTES:
-            raise HTTPException(status_code=413, detail=f"{filename}: file exceeds the 10 MB limit.")
-        total_bytes += len(content)
-        if total_bytes > settings.MAX_UPLOAD_TOTAL_BYTES:
-            raise HTTPException(status_code=413, detail="Combined upload exceeds the 25 MB limit.")
-        file_contents.append((filename, suffix, content))
-        if suffix in {"csv", "xlsx"}:
-            tabular_files.append((filename, content))
-        else:
-            leaflet_files.append((filename, suffix, content))
-
-    if not tabular_files or not leaflet_files:
-        raise HTTPException(
-            status_code=422,
-            detail="Upload sales data, current stock data, and at least one PDF or image leaflet.",
-        )
-
-    try:
-        imported = parse_sales_stock_files(tabular_files)
-    except ImportValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    if any(suffix in {"jpg", "jpeg", "png"} for _, suffix, _ in leaflet_files):
-        if not _provider_capabilities()["amd_image_extraction"]["enabled"]:
-            raise HTTPException(status_code=503, detail="AMD image extraction is disabled or not configured.")
-    if any(suffix == "pdf" for _, suffix, _ in leaflet_files):
-        if not _provider_capabilities()["evolus_pdf_extraction"]["enabled"]:
-            raise HTTPException(status_code=503, detail="Evolus PDF extraction is disabled or not configured.")
-
+async def _build_import_review(
+    file_contents: List[tuple[str, str, bytes]],
+    tabular_files: List[tuple[str, bytes]],
+    leaflet_files: List[tuple[str, str, bytes]],
+    imported: Dict[str, Any],
+    lead_times: Dict[str, int],
+    planning_horizon_days: int,
+) -> Dict[str, Any]:
     provider_limit = asyncio.Semaphore(2)
 
     async def extract_one(filename: str, content: bytes) -> tuple[str, Dict[str, Any]]:
@@ -444,7 +397,9 @@ async def create_import_review(
                 return filename, result
             except (ProviderNotConfiguredError, EvolusNotConfiguredError) as exc:
                 raise HTTPException(status_code=503, detail=f"{filename}: provider is not configured.") from exc
-            except (ProviderRequestError, EvolusRequestError) as exc:
+            except EvolusRequestError as exc:
+                raise HTTPException(status_code=502, detail=f"{filename}: {exc}") from exc
+            except ProviderRequestError as exc:
                 raise HTTPException(status_code=502, detail=f"{filename}: provider extraction failed.") from exc
             except ValueError as exc:
                 raise HTTPException(status_code=502, detail=f"{filename}: extracted data failed validation.") from exc
@@ -547,6 +502,126 @@ async def create_import_review(
         ],
         "providers": _provider_capabilities(),
     }
+
+
+async def _run_import_review_job(
+    job_id: str,
+    file_contents: List[tuple[str, str, bytes]],
+    tabular_files: List[tuple[str, bytes]],
+    leaflet_files: List[tuple[str, str, bytes]],
+    imported: Dict[str, Any],
+    lead_times: Dict[str, int],
+    planning_horizon_days: int,
+) -> None:
+    try:
+        result = await _build_import_review(
+            file_contents,
+            tabular_files,
+            leaflet_files,
+            imported,
+            lead_times,
+            planning_horizon_days,
+        )
+        update_file_import_job(job_id, status="completed", result=result)
+    except HTTPException as exc:
+        update_file_import_job(job_id, status="failed", error=str(exc.detail))
+    except Exception:
+        logger.exception("File import review job %s failed unexpectedly.", job_id)
+        update_file_import_job(
+            job_id,
+            status="failed",
+            error="File extraction failed unexpectedly. Please retry the upload.",
+        )
+
+
+@app.post("/api/plan/from-files", status_code=202)
+async def create_import_review(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    supplier_lead_times_json: str = Form(default="{}"),
+    planning_horizon_days: int = Form(default=14, ge=1, le=365),
+    user: User = Depends(require_user),
+):
+    """Queue file parsing and extraction for asynchronous owner review."""
+    if not files or len(files) > settings.MAX_UPLOAD_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Upload between 1 and {settings.MAX_UPLOAD_FILES} files.",
+        )
+
+    lead_times = {
+        str(supplier).casefold().strip(): days
+        for supplier, days in settings.SUPPLIER_LEAD_TIMES.items()
+    }
+    lead_times.update(_parse_lead_times(supplier_lead_times_json))
+    file_contents: List[tuple[str, str, bytes]] = []
+    total_bytes = 0
+    tabular_files: List[tuple[str, bytes]] = []
+    leaflet_files: List[tuple[str, str, bytes]] = []
+
+    for index, upload in enumerate(files, start=1):
+        original_name = upload.filename or f"upload-{index}"
+        filename = re.split(r"[/\\]", original_name)[-1][:255]
+        suffix = filename.rsplit(".", 1)[-1].casefold() if "." in filename else ""
+        if suffix not in {"csv", "xlsx", "pdf", "jpg", "jpeg", "png"}:
+            raise HTTPException(status_code=415, detail=f"{filename}: unsupported file type.")
+        content = await upload.read(settings.MAX_UPLOAD_FILE_BYTES + 1)
+        if len(content) > settings.MAX_UPLOAD_FILE_BYTES:
+            raise HTTPException(status_code=413, detail=f"{filename}: file exceeds the 10 MB limit.")
+        total_bytes += len(content)
+        if total_bytes > settings.MAX_UPLOAD_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail="Combined upload exceeds the 25 MB limit.")
+        file_contents.append((filename, suffix, content))
+        if suffix in {"csv", "xlsx"}:
+            tabular_files.append((filename, content))
+        else:
+            leaflet_files.append((filename, suffix, content))
+
+    if not tabular_files or not leaflet_files:
+        raise HTTPException(
+            status_code=422,
+            detail="Upload sales data, current stock data, and at least one PDF or image leaflet.",
+        )
+
+    try:
+        imported = parse_sales_stock_files(tabular_files)
+    except ImportValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if any(suffix in {"jpg", "jpeg", "png"} for _, suffix, _ in leaflet_files):
+        if not _provider_capabilities()["amd_image_extraction"]["enabled"]:
+            raise HTTPException(status_code=503, detail="AMD image extraction is disabled or not configured.")
+    if any(suffix == "pdf" for _, suffix, _ in leaflet_files):
+        if not _provider_capabilities()["evolus_pdf_extraction"]["enabled"]:
+            raise HTTPException(status_code=503, detail="Evolus PDF extraction is disabled or not configured.")
+
+    if user.id is None:
+        raise HTTPException(status_code=401, detail="Authenticated user record is unavailable.")
+    job_id = create_file_import_job(user.id)
+    background_tasks.add_task(
+        _run_import_review_job,
+        job_id,
+        file_contents,
+        tabular_files,
+        leaflet_files,
+        imported,
+        lead_times,
+        planning_horizon_days,
+    )
+    return {"job_id": job_id, "status": "processing"}
+
+
+@app.get("/api/plan/from-files/{job_id}")
+def get_import_review_job(job_id: str, user: User = Depends(require_user)):
+    """Return the authenticated owner's file-import job state."""
+    job = get_file_import_job(user.id, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="File import job not found.")
+    if job["status"] == "completed":
+        return {"job_id": job_id, "status": job["status"], "result": job["result"]}
+    if job["status"] == "failed":
+        return {"job_id": job_id, "status": job["status"], "error": job["error"]}
+    return {"job_id": job_id, "status": job["status"]}
 
 
 @app.post("/api/plan/from-files/forecast")
