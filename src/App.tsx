@@ -14,8 +14,25 @@ import { SplashScreen } from './components/auth/SplashScreen';
 import { LoginScreen } from './components/auth/LoginScreen';
 import { SignUpScreen } from './components/auth/SignUpScreen';
 import { ClientProfile } from './components/ClientProfile';
-import { ProductItem, RestockingPlan, PurchaseOrder, TraceEvent, AuthUser, WapeMetrics } from './types';
-import { generatePlan, approvePlan, createPurchaseOrders, fetchTraceEvents, fetchWapeMetrics, logoutUser } from './services/api';
+import {
+  ProductItem,
+  RestockingPlan,
+  PurchaseOrder,
+  TraceEvent,
+  AuthUser,
+  WapeMetrics,
+  FileImportCandidate,
+  FileImportReview
+} from './types';
+import {
+  generatePlan,
+  approvePlan,
+  createPurchaseOrders,
+  fetchTraceEvents,
+  fetchWapeMetrics,
+  logoutUser,
+  uploadPlanningFiles
+} from './services/api';
 import { User, Bell, Shield, Sparkles, LogOut, MessageSquare } from 'lucide-react';
 
 export default function App() {
@@ -150,11 +167,52 @@ export default function App() {
     recomputePlan(budget, horizonDays, updatedList);
   };
 
-  const handleProcessFiles = async () => {
+  const handleProcessFiles = async (
+    files: File[],
+    supplierLeadTimes: Record<string, number>,
+    planningHorizon: number,
+    useDemoData: boolean
+  ): Promise<FileImportReview | null> => {
+    if (!files.length) {
+      if (!useDemoData) throw new Error('Upload sales, stock, and leaflet files or enable demo data.');
+      await recomputePlan(budget, planningHorizon, products);
+      setCurrentStep(2);
+      setCurrentTab('catalogue');
+      setMaxStepReached(prev => Math.max(prev, 2));
+      return null;
+    }
     setIsProcessing(true);
-    await new Promise(r => setTimeout(r, 700));
-    await recomputePlan(budget, horizonDays, products);
-    setIsProcessing(false);
+    try {
+      return await uploadPlanningFiles(files, supplierLeadTimes, planningHorizon);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleImportCandidates = (candidates: FileImportCandidate[]) => {
+    const imported: ProductItem[] = candidates.map((candidate, index) => ({
+      id: `import-${candidate.id}-${index}`,
+      product: candidate.matched_product,
+      pack_size: candidate.pack_size,
+      supplier_price: Number(candidate.supplier_price),
+      our_price: Number(candidate.our_price),
+      unit_price: Number(candidate.unit_price),
+      supplier: candidate.supplier,
+      status: 'Confirmed',
+      confidence: candidate.confidence,
+      recommended_qty: Number(candidate.recommended_qty),
+      at_risk: candidate.at_risk,
+      is_out_of_stock: candidate.current_stock === 0,
+      category: 'Imported',
+      source: 'file_import',
+      reviewed: true,
+      lead_time_days: Number(candidate.lead_time_days),
+      retail_price_verified: candidate.retail_price_verified === true,
+      currency: candidate.currency || '',
+      currency_verified: candidate.currency_verified === true
+    }));
+    setProducts(imported);
+    void recomputePlan(budget, horizonDays, imported);
     setCurrentStep(2);
     setCurrentTab('catalogue');
     setMaxStepReached(prev => Math.max(prev, 2));
@@ -346,6 +404,7 @@ export default function App() {
               demoData={demoData}
               onToggleDemoData={(val) => setDemoData(val)}
               onProcessFiles={handleProcessFiles}
+              onImportCandidates={handleImportCandidates}
               isProcessing={isProcessing}
             />
           )}

@@ -1,4 +1,13 @@
-import { RestockingPlan, PurchaseOrder, TraceEvent, WapeMetrics, AuthUser } from '../types';
+import {
+  RestockingPlan,
+  PurchaseOrder,
+  TraceEvent,
+  WapeMetrics,
+  AuthUser,
+  FileImportReview,
+  ImportForecast,
+  ProviderCapabilities
+} from '../types';
 
 export const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 const AUTH_TOKEN_KEY = 'stockup-pulse-access-token';
@@ -33,6 +42,12 @@ export async function fetchHealth() {
   } catch {
     return { status: 'unavailable' };
   }
+}
+
+export async function fetchProviderStatus(): Promise<ProviderCapabilities> {
+  const res = await fetch(`${API_BASE}/providers`);
+  if (!res.ok) throw new Error(`Provider status request failed: ${res.status}`);
+  return await res.json();
 }
 
 export async function fetchTraceEvents(): Promise<{ summary: any; events: TraceEvent[] }> {
@@ -76,6 +91,46 @@ export async function generatePlan(
   return data;
 }
 
+export async function uploadPlanningFiles(
+  files: File[],
+  supplierLeadTimes: Record<string, number>,
+  planningHorizonDays: number
+): Promise<FileImportReview> {
+  const body = new FormData();
+  files.forEach(file => body.append('files', file, file.name));
+  body.append('supplier_lead_times_json', JSON.stringify(supplierLeadTimes));
+  body.append('planning_horizon_days', String(planningHorizonDays));
+  const res = await fetch(`${API_BASE}/plan/from-files`, {
+    method: 'POST',
+    headers: authenticatedHeaders(),
+    body
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || `File import failed: ${res.status}`);
+  return data as FileImportReview;
+}
+
+export async function forecastImportedCandidate(
+  salesHistory: number[],
+  currentStock: number,
+  leadTimeDays: number,
+  planningHorizonDays: number
+): Promise<ImportForecast> {
+  const res = await fetch(`${API_BASE}/plan/from-files/forecast`, {
+    method: 'POST',
+    headers: authenticatedHeaders(true),
+    body: JSON.stringify({
+      sales_history: salesHistory,
+      current_stock: currentStock,
+      lead_time_days: leadTimeDays,
+      planning_horizon_days: planningHorizonDays
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || `Forecast failed: ${res.status}`);
+  return data as ImportForecast;
+}
+
 export async function approvePlan(approved: boolean, planId?: string) {
   const res = await fetch(`${API_BASE}/plan/approve`, {
     method: 'POST',
@@ -105,7 +160,9 @@ export async function createPurchaseOrders(approved: boolean, planId?: string): 
   return data.orders;
 }
 
-export async function sendWhatsAppMessage(body: string): Promise<{ reply: string; orders?: PurchaseOrder[] }> {
+export async function sendWhatsAppMessage(
+  body: string
+): Promise<{ reply: string; orders?: PurchaseOrder[]; channel: 'simulator'; delivery_status: 'not_sent' }> {
   const res = await fetch(`${API_BASE}/whatsapp/simulate`, {
     method: 'POST',
     headers: authenticatedHeaders(true),
@@ -202,4 +259,3 @@ export async function getSessionUser(): Promise<AuthUser | null> {
   }
   return null;
 }
-

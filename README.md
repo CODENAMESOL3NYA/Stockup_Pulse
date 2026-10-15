@@ -24,12 +24,12 @@ The Python allocator is deterministic and currently uses a greedy allocation str
 
 | Integration | Current status |
 | --- | --- |
-| **AMD Radeon Cloud Token Factory** | Planned, not active. The adapter still uses local fixture extraction and deterministic matching; it does not currently call AMD. The intended OpenAI-compatible base URL is `https://developer.amd.com.cn/radeon/api/v1`. Model IDs should be discovered from `/v1/models` because the catalog changes. |
-| **Evolus** | Not configured. Adapter methods return a `not_configured` status; provider document extraction is not connected. |
-| **Twilio WhatsApp** | Not configured. `/api/whatsapp/webhook` returns HTTP 501 until signature verification is implemented. The authenticated `/api/whatsapp/simulate` endpoint is a local simulator, not a live WhatsApp channel. |
+| **AMD Radeon Cloud Token Factory** | Image extraction is implemented and disabled by default. It validates `AMD_ROCM_MODEL` against live `/v1/models` image capability metadata. |
+| **Evolus** | Configured-workflow PDF extraction is implemented and disabled by default. Sandbox workflow result compatibility must be confirmed before enabling it. |
+| **Twilio WhatsApp** | Inbound signature verification and owner-scoped approval are implemented and disabled by default. The authenticated `/api/whatsapp/simulate` endpoint remains a local simulator. Outbound supplier delivery is disabled. |
 | **Retailer scraper** | Best-effort public-page scraping is available on demand. Retailers may block requests or change page markup. Seed prices remain demo fixtures. |
 
-External credentials are optional for local development and must not be committed. See the [integration plan](stockup_pulse/INTEGRATION_PLAN.md) for the proposed provider work. The AMD Token Factory key is team-shared, must be redeemed by every team member, and belongs only in a local secret such as `AMD_ROCM_API_KEY`.
+External credentials are optional for local development and must not be committed. See the [integration plan](stockup_pulse/INTEGRATION_PLAN.md) for the provider contracts and rollout criteria. The AMD Token Factory key is team-shared, must be redeemed by every team member, and belongs only in a local secret such as `AMD_ROCM_API_KEY`.
 
 ## Requirements
 
@@ -99,7 +99,40 @@ npm run build
 
 Backend settings are loaded from `stockup_pulse/.env`; see [the backend environment example](stockup_pulse/.env.example). The frontend's optional `VITE_API_BASE_URL` belongs in root `.env.local`; the Express proxy's optional `PYTHON_API_URL` belongs in root `.env`.
 
-Relevant provider settings include `AMD_ROCM_HOST`, `AMD_ROCM_API_KEY`, `AMD_ROCM_MODEL`, `EVOLUS_ENDPOINT`, `EVOLUS_API_KEY`, `TWILIO_ACCOUNT_SID`, and `TWILIO_AUTH_TOKEN`. Provider integrations remain disabled or incomplete by default. Never put actual API keys in source control, issue reports, or chat.
+Provider integrations are off by default. To enable them, set the corresponding `*_ENABLED` flag and all required values in the local `stockup_pulse/.env` file:
+
+| Provider | Required settings |
+| --- | --- |
+| AMD image extraction | `AMD_ROCM_ENABLED`, `AMD_ROCM_HOST`, `AMD_ROCM_API_KEY`, and an exact `AMD_ROCM_MODEL` from the live catalog |
+| Evolus PDF extraction | `EVOLUS_ENABLED`, `EVOLUS_ENDPOINT`, `EVOLUS_API_KEY`, `EVOLUS_APPLICATION_ID`, and `EVOLUS_WORKFLOW_ID` |
+| Twilio inbound webhook | `TWILIO_WEBHOOK_ENABLED`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and the externally reachable canonical `TWILIO_WEBHOOK_PUBLIC_URL` |
+
+For Evolus, copy the application ID and workflow ID for the document-extraction workflow from your Evolus setup into `stockup_pulse/.env`; setting only `EVOLUS_ENABLED=true` and an API key is not sufficient. Restart the FastAPI process after changing this file, then confirm `evolus_pdf_extraction.enabled` is `true` from `http://127.0.0.1:8000/api/providers`.
+
+`AMD_ROCM_MODEL` has no default: the configured preference must exist in AMD's live model catalog and explicitly support image input. The backend environment example lists the supplied model IDs, but catalog availability and capability must be checked at runtime. `OUTBOUND_SUPPLIER_DISPATCH_ENABLED` is intentionally disabled; supplier recipients and opt-ins are not configured. Never put actual API keys in source control, issue reports, or chat.
+
+### File import formats
+
+The authenticated upload accepts 1–5 CSV, XLSX, PDF, JPG/JPEG, or PNG files (10 MiB per file, 25 MiB total file payload). FastAPI enforces the per-file and combined file limits; the Express proxy caps streamed multipart and URL-encoded request bodies at 26 MiB to allow multipart envelope overhead. CSV/XLSX data is parsed locally; images require the AMD provider and PDFs require the configured Evolus workflow. An upload-based review needs sales rows, stock rows, and at least one leaflet or PDF. Provider extraction is all-or-nothing; no plan is saved until reviewed candidates are submitted through the normal planning flow.
+
+CSV sales headers are exactly `date,product,quantity_sold`, with ISO `YYYY-MM-DD` dates. CSV stock headers are `product,current_stock`. Quantities must be finite and nonnegative and use sellable units. A workbook may contain `sales` and `stock` sheets with the corresponding headers. Duplicate sales rows aggregate by normalized product and date; conflicting duplicate stock rows are rejected. Missing calendar days inside the imported sales interval are zero-filled.
+
+Example sales CSV:
+
+```csv
+date,product,quantity_sold
+2025-01-01,Brown Bread,8
+2025-01-02,Brown Bread,6
+```
+
+Example stock CSV:
+
+```csv
+product,current_stock
+Brown Bread,4
+```
+
+Uploaded leaflet items require owner review of product mapping, pack/unit cost, verified per-unit retail price, and supplier lead time before planning. Provider status is available from `/api/providers`; it never returns credentials. After setup, run the tests and frontend checks listed above. Real AMD/Evolus/Twilio sandbox verification remains an explicit rollout prerequisite.
 
 ## Docker
 

@@ -3,30 +3,55 @@ import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import { Readable, Transform } from 'node:stream';
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
+const MAX_PROXY_UPLOAD_BYTES = 26 * 1024 * 1024;
 
 app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 app.use('/api', async (req: Request, res: Response) => {
   const backendUrl = process.env.PYTHON_API_URL || 'http://127.0.0.1:8000';
   const contentType = req.headers['content-type'];
   const headers: Record<string, string> = {};
   if (contentType) headers['content-type'] = contentType;
+  if (req.headers['content-length']) headers['content-length'] = req.headers['content-length'];
   if (req.headers.authorization) headers.authorization = req.headers.authorization;
   const twilioSignature = req.header('x-twilio-signature');
   if (twilioSignature) headers['x-twilio-signature'] = twilioSignature;
 
-  let body: string | undefined;
+  let body: BodyInit | undefined;
+  let duplex: 'half' | undefined;
+  let uploadLimitExceeded = false;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    if (req.is('application/x-www-form-urlencoded')) {
-      body = new URLSearchParams(req.body as Record<string, string>).toString();
-    } else if (req.is('application/json')) {
+    if (req.is('application/json')) {
       body = JSON.stringify(req.body ?? {});
+    } else if (req.is('multipart/form-data') || req.is('application/x-www-form-urlencoded')) {
+      const contentLength = Number(req.headers['content-length'] || 0);
+      if (contentLength > MAX_PROXY_UPLOAD_BYTES) {
+        res.status(413).json({ detail: 'Request body exceeds the 26 MiB proxy limit.' });
+        return;
+      }
+      let receivedBytes = 0;
+      const boundedBody = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          receivedBytes += chunk.length;
+          if (receivedBytes > MAX_PROXY_UPLOAD_BYTES) {
+            uploadLimitExceeded = true;
+            req.unpipe(boundedBody);
+            req.resume();
+            callback(new Error('UPLOAD_LIMIT_EXCEEDED'));
+            return;
+          }
+          callback(null, chunk);
+        }
+      });
+      req.pipe(boundedBody);
+      body = Readable.toWeb(boundedBody) as ReadableStream<Uint8Array>;
+      duplex = 'half';
     }
   }
 
@@ -35,11 +60,16 @@ app.use('/api', async (req: Request, res: Response) => {
       method: req.method,
       headers,
       body,
-    });
+      ...(duplex ? { duplex } : {}),
+    } as RequestInit & { duplex?: 'half' });
     const upstreamType = upstream.headers.get('content-type');
     if (upstreamType) res.setHeader('content-type', upstreamType);
     res.status(upstream.status).send(Buffer.from(await upstream.arrayBuffer()));
   } catch {
+    if (uploadLimitExceeded && !res.headersSent) {
+      res.status(413).json({ detail: 'Request body exceeds the 26 MiB proxy limit.' });
+      return;
+    }
     res.status(503).json({ detail: 'Python API unavailable. Start the FastAPI service on port 8000.' });
   }
 });

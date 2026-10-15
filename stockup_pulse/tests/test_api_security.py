@@ -1,3 +1,7 @@
+import base64
+import hashlib
+import hmac
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine
@@ -174,6 +178,46 @@ def test_plan_rejects_invalid_financial_inputs(client):
     assert response.status_code == 422
 
 
+def test_file_import_plan_requires_verified_zar_currency_and_integer_lead_time(client):
+    token, _ = register(client, "+27820000016")
+    item = {
+        "product": "Rice",
+        "recommended_qty": 2,
+        "unit_price": 10,
+        "supplier_price": 60,
+        "our_price": 15,
+        "supplier": "Makro",
+        "source": "file_import",
+        "reviewed": True,
+        "retail_price_verified": True,
+        "currency": "ZAR",
+        "currency_verified": True,
+        "lead_time_days": 2,
+    }
+    valid = client.post(
+        "/api/plan",
+        headers=auth(token),
+        json={"budget": 100, "items": [item]},
+    )
+    assert valid.status_code == 200
+
+    fractional_lead_time = {**item, "lead_time_days": 2.5}
+    invalid = client.post(
+        "/api/plan",
+        headers=auth(token),
+        json={"budget": 100, "items": [fractional_lead_time]},
+    )
+    assert invalid.status_code == 422
+
+    unverified_currency = {**item, "currency_verified": False}
+    invalid = client.post(
+        "/api/plan",
+        headers=auth(token),
+        json={"budget": 100, "items": [unverified_currency]},
+    )
+    assert invalid.status_code == 422
+
+
 def test_sensitive_read_and_scrape_routes_require_auth(client):
     assert client.get("/api/trace").status_code == 401
     assert client.get("/api/market-prices").status_code == 401
@@ -185,3 +229,160 @@ def test_logout_revokes_session(client):
     assert client.get("/api/auth/me", headers=auth(token)).status_code == 200
     assert client.post("/api/auth/logout", headers=auth(token)).status_code == 200
     assert client.get("/api/auth/me", headers=auth(token)).status_code == 401
+
+
+def _twilio_signature(url: str, fields: dict[str, str], token: str) -> str:
+    payload = url + "".join(key + fields[key] for key in sorted(fields))
+    digest = hmac.new(token.encode(), payload.encode(), hashlib.sha1).digest()
+    return base64.b64encode(digest).decode()
+
+
+def test_twilio_signature_sender_isolation_and_repeated_approval_are_safe(client, monkeypatch):
+    public_url = "https://stockup.example/api/whatsapp/webhook"
+    auth_token = "test-twilio-token"
+    monkeypatch.setattr(api.settings, "TWILIO_WEBHOOK_ENABLED", True)
+    monkeypatch.setattr(api.settings, "TWILIO_ACCOUNT_SID", "test-account")
+    monkeypatch.setattr(api.settings, "TWILIO_AUTH_TOKEN", auth_token)
+    monkeypatch.setattr(api.settings, "TWILIO_WEBHOOK_PUBLIC_URL", public_url)
+    owner_token, _ = register(client, "+27820000011")
+    register(client, "+27820000012")
+    plan = client.post(
+        "/api/plan",
+        json={"budget": 1000, "items": [{"product": "Rice", "recommended_qty": 2, "unit_price": 10}]},
+        headers=auth(owner_token),
+    ).json()
+    fields = {
+        "From": "whatsapp:+27820000011",
+        "Body": "APPROVE",
+        "MessageSid": "SM-test-1",
+    }
+
+    valid = client.post(
+        "/api/whatsapp/webhook",
+        data=fields,
+        headers={"X-Twilio-Signature": _twilio_signature(public_url, fields, auth_token)},
+    )
+    assert valid.status_code == 200
+    assert "Approval confirmed" in valid.text
+    initial_orders = client.get("/api/orders", headers=auth(owner_token)).json()
+    assert len(initial_orders) == 1
+
+    repeated = client.post(
+        "/api/whatsapp/webhook",
+        data=fields,
+        headers={"X-Twilio-Signature": _twilio_signature(public_url, fields, auth_token)},
+    )
+    assert repeated.status_code == 200
+    assert "Plan already approved" in repeated.text
+    assert [order["order_number"] for order in client.get(
+        "/api/orders", headers=auth(owner_token)
+    ).json()] == [initial_orders[0]["order_number"]]
+
+    attacker_fields = {**fields, "From": "whatsapp:+27820000012"}
+    attacker = client.post(
+        "/api/whatsapp/webhook",
+        data=attacker_fields,
+        headers={"X-Twilio-Signature": _twilio_signature(public_url, attacker_fields, auth_token)},
+    )
+    assert attacker.status_code == 200
+    assert "No pending" in attacker.text
+    assert client.post(
+        "/api/whatsapp/webhook",
+        data=fields,
+        headers={"X-Twilio-Signature": "invalid"},
+    ).status_code == 403
+
+
+def test_file_import_requires_auth_and_provider_status_does_not_expose_credentials(client, monkeypatch):
+    monkeypatch.setattr(api.settings, "AMD_ROCM_ENABLED", True)
+    monkeypatch.setattr(api.settings, "AMD_ROCM_HOST", "https://amd.example/v1")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_API_KEY", "never-return-this")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_MODEL", "vision-model")
+    status = client.get("/api/providers")
+    assert status.status_code == 200
+    assert "never-return-this" not in status.text
+    assert status.json()["amd_image_extraction"]["enabled"] is True
+
+    assert client.post(
+        "/api/plan/from-files",
+        files=[("files", ("sales.csv", b"date,product,quantity_sold", "text/csv"))],
+    ).status_code == 401
+
+
+def test_file_import_rejects_oversized_file(client):
+    token, _ = register(client, "+27820000013")
+    response = client.post(
+        "/api/plan/from-files",
+        headers=auth(token),
+        files=[("files", ("too-large.csv", b"x" * (10 * 1024 * 1024 + 1), "text/csv"))],
+    )
+    assert response.status_code == 413
+
+
+def test_file_import_returns_review_candidates_without_saving_a_plan(client, monkeypatch):
+    token, user_id = register(client, "+27820000014")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_ENABLED", True)
+    monkeypatch.setattr(api.settings, "AMD_ROCM_HOST", "https://amd.example/v1")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_API_KEY", "test-key")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_MODEL", "vision-model")
+    monkeypatch.setattr(
+        api.leaflet_extractor,
+        "extract_structured_from_leaflet",
+        lambda content, filename: {
+            "source": "amd",
+            "extracted_items": [{
+                "product": "Milk 1L",
+                "pack_size": "6 x 1L",
+                "pack_price": 60,
+                "supplier": "Makro",
+                "currency": "ZAR",
+                "evidence": "6 for R60",
+                "confidence": 0.9,
+            }],
+        },
+    )
+
+    response = client.post(
+        "/api/plan/from-files",
+        headers=auth(token),
+        data={"supplier_lead_times_json": '{"Makro": 2}', "planning_horizon_days": "14"},
+        files=[
+            ("files", ("sales.csv", b"date,product,quantity_sold\n2025-03-01,Milk 1L,4\n", "text/csv")),
+            ("files", ("stock.csv", b"product,current_stock\nMilk 1L,2\n", "text/csv")),
+            ("files", ("offer.jpg", b"fake image bytes", "image/jpeg")),
+        ],
+    )
+
+    assert response.status_code == 200
+    candidate = response.json()["candidates"][0]
+    assert candidate["unit_price"] == 10
+    assert candidate["sales_history"] == [4]
+    assert candidate["lead_time_days"] == 2
+    assert candidate["currency_verified"] is False
+    assert database.get_plan_for_user(user_id) is None
+
+
+def test_file_import_provider_failure_returns_no_partial_review(client, monkeypatch):
+    token, user_id = register(client, "+27820000015")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_ENABLED", True)
+    monkeypatch.setattr(api.settings, "AMD_ROCM_HOST", "https://amd.example/v1")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_API_KEY", "test-key")
+    monkeypatch.setattr(api.settings, "AMD_ROCM_MODEL", "vision-model")
+
+    def fail_extraction(content, filename):
+        raise api.ProviderRequestError("sensitive provider detail")
+
+    monkeypatch.setattr(api.leaflet_extractor, "extract_structured_from_leaflet", fail_extraction)
+    response = client.post(
+        "/api/plan/from-files",
+        headers=auth(token),
+        files=[
+            ("files", ("sales.csv", b"date,product,quantity_sold\n2025-03-01,Milk 1L,4\n", "text/csv")),
+            ("files", ("stock.csv", b"product,current_stock\nMilk 1L,2\n", "text/csv")),
+            ("files", ("offer.jpg", b"fake image bytes", "image/jpeg")),
+        ],
+    )
+
+    assert response.status_code == 502
+    assert "sensitive provider detail" not in response.text
+    assert database.get_plan_for_user(user_id) is None

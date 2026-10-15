@@ -44,20 +44,20 @@ export const Step5Orders: React.FC<Step5OrdersProps> = ({
       {/* Header */}
       <div>
         <div className="text-[11px] font-mono font-bold tracking-widest text-[#E50000] uppercase mb-1">
-          STEP 5 OF 5 // PURCHASE ORDERS DISPATCH
+          STEP 5 OF 5 // PURCHASE ORDERS
         </div>
         <h2 className="text-2xl font-black text-white tracking-wider uppercase">
           GENERATED PURCHASE ORDERS
         </h2>
         <p className="text-xs text-[#888888] mt-1 tracking-wide">
-          Purchase orders have been minted. Download official PDF invoices, JSON records, or dispatch to WhatsApp.
+          Purchase orders are recorded locally. Supplier messaging is not sent until verified recipients and opt-ins exist.
         </p>
       </div>
 
       {/* Confirmation Notification Banner */}
       <div className="p-4 rounded-[4px] bg-[#1A1A1A] border border-[#00CC66] border-l-4 border-l-[#00CC66] text-sm">
         <div className="font-bold text-[#00CC66] uppercase font-mono tracking-wider">
-          ORDERS DISPATCHED &amp; RECORDED SUCCESSFULLY
+          ORDERS RECORDED · SUPPLIER DELIVERY DISABLED
         </div>
         <div className="text-xs text-white mt-1 font-mono">
           Order numbers: {poRefs}
@@ -84,7 +84,7 @@ export const Step5Orders: React.FC<Step5OrdersProps> = ({
               : 'border-transparent text-[#888888] hover:text-white'
           }`}
         >
-          Supplier Messages
+          Supplier Message Templates
         </button>
         <button
           onClick={() => setActiveTab('downloads')}
@@ -125,7 +125,7 @@ export const Step5Orders: React.FC<Step5OrdersProps> = ({
                       </td>
                       <td className="px-4 py-4">
                         <span className="inline-block px-2 py-0.5 rounded-[2px] text-[10px] font-mono font-bold bg-[#1A1A1A] text-[#00CC66] border border-[#00CC66]/40 uppercase">
-                          {po.status.toUpperCase()}
+                          {po.delivery_status?.replace('_', ' ').toUpperCase() || 'NOT SENT'}
                         </span>
                       </td>
                       <td className="px-6 py-4 text-right">
@@ -177,7 +177,7 @@ export const Step5Orders: React.FC<Step5OrdersProps> = ({
                   onClick={() => handleCopyMessage(po)}
                   className="w-full py-2 bg-[#0B0B0B] hover:bg-[#252525] border border-[#333333] hover:border-[#E50000] text-white text-xs font-bold uppercase rounded-[2px] transition-colors cursor-pointer"
                 >
-                  {copiedId === po.order_number ? 'COPIED TO CLIPBOARD' : 'COPY MESSAGE'}
+                  {copiedId === po.order_number ? 'COPIED · NOT SENT' : 'COPY TEMPLATE · NOT SENT'}
                 </button>
               </div>
             ))}

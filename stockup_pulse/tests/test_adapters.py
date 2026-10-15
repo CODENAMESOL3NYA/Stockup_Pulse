@@ -6,8 +6,9 @@ Verifies:
 """
 
 from stockup_pulse.adapters.amd_llm import AmdLlmAdapter
-from stockup_pulse.adapters.evolus import EvolusAdapter
+from stockup_pulse.adapters.evolus import EvolusAdapter, EvolusNotConfiguredError
 from stockup_pulse.trace.tracker import trace_collector
+import pytest
 
 def test_amd_llm_adjudication_and_trace():
     trace_collector.clear()
@@ -38,8 +39,8 @@ def test_unconfigured_extraction_is_reported_as_demo_fallback():
 
 def test_unconfigured_evolus_adapter_does_not_claim_success():
     trace_collector.clear()
-    result = EvolusAdapter().extract_document(b"fixture", "sample.pdf")
+    with pytest.raises(EvolusNotConfiguredError):
+        EvolusAdapter().extract_document(b"fixture", "sample.pdf")
     event = trace_collector.get_events()[-1]
-    assert result["status"] == "not_configured"
     assert event.event_type == "fallback"
     assert event.status == "not_configured"

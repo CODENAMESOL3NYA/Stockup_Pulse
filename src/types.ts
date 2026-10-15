@@ -12,6 +12,12 @@ export interface ProductItem {
   at_risk: boolean;
   is_out_of_stock: boolean;
   category: string;
+  source?: 'file_import';
+  reviewed?: boolean;
+  lead_time_days?: number;
+  retail_price_verified?: boolean;
+  currency?: string;
+  currency_verified?: boolean;
 }
 
 export interface AllocatedItem {
@@ -76,6 +82,7 @@ export interface PurchaseOrder {
   total_items: number;
   total_spend: number;
   status: string;
+  delivery_status?: 'queued' | 'sent' | 'failed' | 'not_sent';
   items: AllocatedItem[];
   whatsapp_message: string;
 }
@@ -110,4 +117,69 @@ export interface AuthUser {
   phone: string;
   full_name: string;
   shop_name: string;
+}
+
+export interface ImportForecast {
+  daily_demand_forecast: number;
+  safety_stock: number;
+  horizon_demand: number;
+  recommended_qty: number;
+  runout_days: number;
+  at_risk_before_delivery: boolean;
+  lead_time_days: number;
+}
+
+export interface ImportAvailableProduct {
+  normalized_key: string;
+  name: string;
+  ambiguous: boolean;
+  sales_history: number[];
+  current_stock: number | null;
+}
+
+export interface FileImportCandidate {
+  id: string;
+  product: string;
+  pack_size: string;
+  pack_count: number | null;
+  supplier_price: number | null;
+  unit_price: number | null;
+  our_price: number | null;
+  supplier: string;
+  variant?: string | null;
+  currency?: string | null;
+  availability?: string | null;
+  evidence?: string | null;
+  currency_verified?: boolean;
+  confidence: number;
+  source: string;
+  source_filename: string;
+  warnings?: string[];
+  matched_product: string;
+  lead_time_days: number | null;
+  current_stock: number | null;
+  sales_history: number[] | null;
+  forecast: ImportForecast | null;
+  recommended_qty: number | null;
+  at_risk: boolean;
+  issues: string[];
+  status: 'Needs review';
+  retail_price_verified?: boolean;
+  include?: boolean;
+}
+
+export interface FileImportReview {
+  status: string;
+  sales_interval: { start: string; end: string };
+  candidates: FileImportCandidate[];
+  available_products: ImportAvailableProduct[];
+  source_files: Array<{ filename: string; kind: string }>;
+  providers: Record<string, { enabled: boolean }>;
+}
+
+export interface ProviderCapabilities {
+  amd_image_extraction: { enabled: boolean };
+  evolus_pdf_extraction: { enabled: boolean };
+  twilio_inbound_webhook: { enabled: boolean };
+  supplier_dispatch: { enabled: boolean };
 }

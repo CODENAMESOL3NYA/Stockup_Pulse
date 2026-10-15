@@ -190,6 +190,12 @@ def get_user_for_token(token: str) -> Optional[User]:
         return session.get(User, auth_session.owner_id)
 
 
+def get_user_for_whatsapp_number(phone: str) -> Optional[User]:
+    clean_phone = normalize_phone(phone)
+    with Session(engine) as session:
+        return session.exec(select(User).where(User.whatsapp_number == clean_phone)).first()
+
+
 def revoke_auth_session(token: str) -> None:
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with Session(engine) as session:
@@ -227,6 +233,16 @@ def get_plan_for_user(owner_id: int, plan_id: Optional[str] = None) -> Optional[
         return json.loads(record.plan_json) if record else None
 
 
+def get_latest_pending_plan_for_user(owner_id: int) -> Optional[dict]:
+    with Session(engine) as session:
+        record = session.exec(
+            select(RestockingPlanRecord)
+            .where(RestockingPlanRecord.owner_id == owner_id, RestockingPlanRecord.approved.is_(False))
+            .order_by(RestockingPlanRecord.created_at_utc.desc())
+        ).first()
+        return json.loads(record.plan_json) if record else None
+
+
 def set_plan_approval(owner_id: int, approved: bool, plan_id: Optional[str] = None) -> Optional[dict]:
     with Session(engine) as session:
         statement = select(RestockingPlanRecord).where(RestockingPlanRecord.owner_id == owner_id)
@@ -244,6 +260,16 @@ def set_plan_approval(owner_id: int, approved: bool, plan_id: Optional[str] = No
         session.add(record)
         session.commit()
         return data
+
+
+def get_orders_for_plan(owner_id: int, plan_id: str) -> list[dict]:
+    with Session(engine) as session:
+        records = session.exec(
+            select(ApiOrderRecord)
+            .where(ApiOrderRecord.owner_id == owner_id, ApiOrderRecord.plan_id == plan_id)
+            .order_by(ApiOrderRecord.id)
+        ).all()
+        return [json.loads(record.order_json) for record in records]
 
 
 def save_orders_for_plan(owner_id: int, plan_id: str, orders: list[dict]) -> list[dict]:
@@ -285,6 +311,7 @@ def save_orders_for_plan(owner_id: int, plan_id: str, orders: list[dict]) -> lis
                     "total_spend": order["total_spend"],
                 }
             )
+            order["delivery_status"] = "not_sent"
             record.order_number = order_number
             record.order_json = json.dumps(order, sort_keys=True)
             session.add(record)
