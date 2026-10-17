@@ -322,7 +322,6 @@ class AmdLlmAdapter:
             self._require_configured()
             self.discover_vision_model()
             
-            # Using 3072 max_tokens ensures quick response without memory starvation
             response = self._request(
                 "POST",
                 "chat/completions",
@@ -343,7 +342,7 @@ class AmdLlmAdapter:
             content = payload["choices"][0]["message"]["content"]
             parsed = self._parse_json_content(content) 
 
-            # Extract list of items
+            # Extract items list tolerating different JSON structures
             items = None
             if isinstance(parsed, list):
                 items = parsed
@@ -355,7 +354,6 @@ class AmdLlmAdapter:
                     or parsed.get("products")
                 )
                 if items is None:
-                    # Check nested objects if wrapped under a document/leaflet key
                     for val in parsed.values():
                         if isinstance(val, dict) and "extracted_items" in val:
                             items = val["extracted_items"]
@@ -367,33 +365,96 @@ class AmdLlmAdapter:
             if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
                 raise ProviderRequestError("AMD returned an invalid leaflet candidate structure.")
 
-            # Sanitize LLM values so they satisfy the schema
+            # Sanitize LLM values so they strictly pass normalize_leaflet_candidates()
             cleaned_items = []
             for item in items:
-                curr = str(item.get("currency") or "").strip().upper()
-                if curr in {"R", "RAND", "RANDS"}:
-                    curr = "ZAR"
+                # 1. Product name is mandatory
+                product = (
+                    item.get("product")
+                    or item.get("product_name")
+                    or item.get("name")
+                    or item.get("item")
+                    or item.get("description")
+                )
+                if not product or not str(product).strip():
+                    continue  # Skip detections without a product name
+                product = str(product).strip()
 
-                raw_price = item.get("pack_price", item.get("supplier_price", item.get("price")))
-                if isinstance(raw_price, str):
-                    clean_price = re.sub(r"[^\d.]", "", raw_price.replace(",", ""))
+                # 2. Pack size
+                pack_size = str(item.get("pack_size") or "").strip()
+
+                # 3. Pack count (reconcile with pack_size prefix like '24 x ...')
+                count_match = re.match(r"^\s*(\d+)\s*[xX×]\s*", pack_size)
+                prefix_count = int(count_match.group(1)) if count_match else None
+
+                raw_count = item.get("pack_count")
+                pack_count = None
+                if raw_count is not None and not isinstance(raw_count, bool):
                     try:
-                        raw_price = float(clean_price) if clean_price else None
-                    except ValueError:
-                        raw_price = None
+                        parsed_c = int(float(str(raw_count).strip().split()[0]))
+                        if parsed_c >= 1:
+                            pack_count = parsed_c
+                    except (ValueError, TypeError):
+                        pack_count = None
 
+                # Avoid 'conflicting pack-count values' error: if pack_size prefix exists, use it
+                if prefix_count is not None:
+                    pack_count = prefix_count
+
+                # 4. Pack price: clean strings like 'R 189.99' into float
+                raw_price = item.get("pack_price", item.get("supplier_price", item.get("price")))
+                pack_price = None
+                if raw_price is not None and not isinstance(raw_price, bool):
+                    if isinstance(raw_price, (int, float)):
+                        if raw_price > 0:
+                            pack_price = round(float(raw_price), 2)
+                    elif isinstance(raw_price, str):
+                        digits_match = re.search(r"(\d+(?:\.\d+)?)", raw_price.replace(",", ""))
+                        if digits_match:
+                            try:
+                                val = float(digits_match.group(1))
+                                if val > 0:
+                                    pack_price = round(val, 2)
+                            except ValueError:
+                                pack_price = None
+
+                # 5. Currency: MUST be 3 letters (e.g. 'ZAR') or None (never 'R')
+                curr = str(item.get("currency") or "").strip().upper()
+                if curr in {"R", "RAND", "RANDS", "ZAR"} or curr.startswith("R"):
+                    curr = "ZAR"
+                elif not re.fullmatch(r"[A-Z]{3}", curr):
+                    curr = None
+
+                # 6. Confidence: float between 0.0 and 1.0
                 conf = item.get("confidence")
-                if isinstance(conf, (int, float)) and conf > 1.0:
-                    conf = min(1.0, conf / 100.0)
+                if isinstance(conf, (int, float)):
+                    if conf > 1.0:
+                        conf = min(1.0, conf / 100.0)
+                    elif conf < 0.0:
+                        conf = 0.0
+                else:
+                    conf = 0.85
 
-                cleaned_item = dict(item)
-                if curr:
-                    cleaned_item["currency"] = curr
-                if raw_price is not None:
-                    cleaned_item["pack_price"] = raw_price
-                if conf is not None:
-                    cleaned_item["confidence"] = conf
-                cleaned_items.append(cleaned_item)
+                # 7. Warnings: must be a list of strings
+                warnings = item.get("warnings")
+                if not isinstance(warnings, list) or not all(isinstance(w, str) for w in warnings):
+                    warnings = []
+
+                cleaned_items.append({
+                    "product": product,
+                    "pack_size": pack_size,
+                    "pack_count": pack_count,
+                    "pack_price": pack_price,
+                    "supplier": str(item.get("supplier") or "").strip() or None,
+                    "currency": curr,
+                    "availability": str(item.get("availability") or "").strip() or None,
+                    "evidence": str(item.get("evidence") or item.get("offer_text") or "").strip() or None,
+                    "confidence": conf,
+                    "warnings": warnings,
+                })
+
+            if not cleaned_items:
+                raise ProviderRequestError("No valid products could be extracted from the leaflet.")
 
             usage = payload.get("usage") or {}
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
