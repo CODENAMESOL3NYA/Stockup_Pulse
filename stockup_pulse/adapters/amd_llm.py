@@ -341,18 +341,16 @@ class AmdLlmAdapter:
             if isinstance(parsed, list):
                 items = parsed
             elif isinstance(parsed, dict):
-                items = (
-                    parsed.get("extracted_items")
-                    or parsed.get("items")
-                    or parsed.get("offers")
-                    or parsed.get("products")
-                )
+                for key in ("extracted_items", "items", "offers", "products"):
+                    if key in parsed and isinstance(parsed[key], list):
+                        items = parsed[key]
+                        break
                 if items is None:
                     for val in parsed.values():
-                        if isinstance(val, dict) and "extracted_items" in val:
+                        if isinstance(val, dict) and isinstance(val.get("extracted_items"), list):
                             items = val["extracted_items"]
                             break
-                        if isinstance(val, list) and val and isinstance(val[0], dict):
+                        if isinstance(val, list) and (not val or isinstance(val[0], dict)):
                             items = val
                             break
 

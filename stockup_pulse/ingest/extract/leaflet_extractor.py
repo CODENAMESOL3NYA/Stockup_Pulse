@@ -31,7 +31,7 @@ class LeafletExtractor:
             "- availability: string or null\n"
             "- evidence: string or null (short observed text quote)\n"
             "- confidence: float between 0.0 and 1.0 (e.g. 0.95)\n"
-            "Do not calculate retail prices, demand, or order quantities. Output only raw JSON."
+            "Do not estimate prices or calculate retail prices, demand, or order quantities. Output only raw JSON."
         )
 
     def extract_structured_from_leaflet(
