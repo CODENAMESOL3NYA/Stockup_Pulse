@@ -1,6 +1,7 @@
 """Evolus document-extraction workflow adapter with bounded polling."""
 
 import json
+import re
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -20,6 +21,9 @@ class EvolusRequestError(RuntimeError):
 
 
 class EvolusAdapter:
+    _SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\b", re.IGNORECASE)
+    _COUNT_RE = re.compile(r"\b(\d+)\s*s\b", re.IGNORECASE)
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -62,6 +66,48 @@ class EvolusAdapter:
             details={"task": "pdf_extraction"},
         ))
 
+    @staticmethod
+    def _normalise_lines(document: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        lines = document.get("lines")
+        if not isinstance(lines, list) or not all(isinstance(line, dict) for line in lines):
+            return None
+        terms = document.get("terms") if isinstance(document.get("terms"), dict) else {}
+        items: List[Dict[str, Any]] = []
+        for line in lines:
+            raw_name = line.get("raw_name") or line.get("product_name")
+            price = line.get("pack_price")
+            if not raw_name or not isinstance(price, (int, float)):
+                continue  # or collect these as rejected lines for review
+            promo = line.get("promo") if isinstance(line.get("promo"), dict) else {}
+            conf = line.get("confidence")
+            conf_vals = (
+                [v for v in conf.values() if isinstance(v, (int, float))]
+                if isinstance(conf, dict) else []
+            )
+            size_match = EvolusAdapter._SIZE_RE.search(raw_name)
+            count_match = EvolusAdapter._COUNT_RE.search(raw_name)
+            if size_match:
+                pack_size = f"{size_match.group(1)}{size_match.group(2).lower()}"
+            else:
+                pack_size = f"{line.get('pack_size')}{line.get('pack_unit') or ''}"
+            items.append({
+                "product": line.get("product_name") or raw_name,
+                "pack_size": pack_size,
+                "pack_count": int(count_match.group(1)) if count_match else None,
+                "pack_price": float(price),
+                "supplier": document.get("supplier"),
+                "currency": document.get("currency"),
+                "availability": None,
+                "evidence": " | ".join(filter(None, [raw_name, promo.get("promo_note")])),
+                "confidence": min(conf_vals) if conf_vals else None,
+                "was_price": promo.get("was_price"),
+                "valid_to": document.get("valid_to"),
+                "minimum_order": terms.get("minimum_order"),
+                "prices_include_vat": document.get("prices_include_vat"),
+                "needs_review": bool(line.get("needs_review")),
+            })
+        return items
+
     def extract_document(
         self,
         file_content: bytes,
@@ -87,7 +133,7 @@ class EvolusAdapter:
                 submitted = client.post(
                     execute_url,
                     headers=self._headers(),
-                    data={"input": prompt},
+                    data={"input": None},
                     files={"file": (filename, file_content, "application/pdf")},
                 )
                 if submitted.status_code != 202:
@@ -137,12 +183,16 @@ class EvolusAdapter:
                         result = execution.get("output")
                         if result is None:
                             result = execution.get("result")
+                        # 1) Decode a JSON string first (it may hold the "lines" document).
                         if isinstance(result, str):
                             try:
                                 result = json.loads(result)
                             except ValueError as exc:
                                 raise EvolusRequestError("Evolus workflow result was not valid JSON.") from exc
-                        if isinstance(result, dict):
+                        # 2) Then unwrap/normalise whichever dict shape arrived.
+                        if isinstance(result, dict) and "lines" in result:
+                            result = self._normalise_lines(result)
+                        elif isinstance(result, dict):
                             result = result.get("extracted_items", result.get("items"))
                         if not isinstance(result, list) or not all(isinstance(item, dict) for item in result):
                             raise EvolusRequestError("Evolus workflow result has an invalid candidate structure.")

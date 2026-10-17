@@ -20,14 +20,18 @@ class LeafletExtractor:
     def _extraction_prompt() -> str:
         return (
             "Read this wholesale promotional leaflet and extract every clearly visible offer. "
-            "Return only a JSON object with an extracted_items array. Each item may contain "
-            "product, pack_size, pack_count, pack_price, supplier, currency, availability, "
-            "evidence, and confidence. Use null for information that is not clearly shown. "
-            "pack_price is the observed price for the whole offered pack, not a calculated "
-            "unit price. Only report pack_count when it is explicitly stated. Do not estimate "
-            "prices, pack counts, retail prices, sales, stock, demand, or order quantities. "
-            "Preserve the currency shown and quote a short evidence phrase when possible. "
-            "confidence must be between 0 and 1."
+            "Return only a valid JSON object with the exact key 'extracted_items' containing a list of objects. "
+            "Each item object must conform to this schema:\n"
+            "- product: string (the product name and brand, never null)\n"
+            "- pack_size: string or null (e.g. '24 x 440ml', '500g', '6 x 1L')\n"
+            "- pack_count: integer or null (total unit count; e.g. for '24 x 440ml', use 24. Do not output 1 for multipacks)\n"
+            "- pack_price: float or null (numeric amount only, e.g. 149.99; DO NOT include 'R', currency symbols, or commas)\n"
+            "- supplier: string or null (e.g. 'Makro', 'Jumbo', 'Shoprite', 'Usave')\n"
+            "- currency: string or null (standard 3-letter ISO code like 'ZAR'; use 'ZAR' for South African Rand, never 'R')\n"
+            "- availability: string or null\n"
+            "- evidence: string or null (short observed text quote)\n"
+            "- confidence: float between 0.0 and 1.0 (e.g. 0.95)\n"
+            "Do not calculate retail prices, demand, or order quantities. Output only raw JSON."
         )
 
     def extract_structured_from_leaflet(

@@ -56,6 +56,7 @@ def _records_from_csv(content: bytes) -> list[dict[str, Any]]:
         raise ImportValidationError("CSV header names must be present and unique.")
     headers = set(normalized_headers)
     rows: list[dict[str, Any]] = []
+    
     for row in reader:
         if None in row:
             raise ImportValidationError("CSV rows must not contain more fields than the header.")

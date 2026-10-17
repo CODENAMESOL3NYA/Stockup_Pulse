@@ -5,16 +5,19 @@ matching and all financial calculations remain deterministic local operations.
 """
 
 import base64
+import io
 import json
 import logging
 import mimetypes
 import random
+import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from PIL import Image
 
 from stockup_pulse.core.config import settings
 from stockup_pulse.trace.tracker import TraceEvent, trace_collector
@@ -30,12 +33,74 @@ class ProviderRequestError(RuntimeError):
     """Raised when a provider request fails; response bodies are never exposed."""
 
 
+_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(kg|g|ml|l)\b", re.IGNORECASE)
+_VARIANT_WORDS = {"zero", "diet", "light", "lite", "white", "brown", "whole", "wholewheat"}
+_SUGAR_VARIANTS = {"zero", "diet", "light", "lite"}
+
+
+def _first_size(text: str) -> Optional[Tuple[float, str]]:
+    """Return the first pack size in the text, normalised to (amount, 'ml' | 'g')."""
+    match = _SIZE_RE.search(text)
+    if not match:
+        return None
+    amount = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit == "l":
+        return amount * 1000.0, "ml"
+    if unit == "kg":
+        return amount * 1000.0, "g"
+    return amount, unit
+
+
+def _variants(text: str) -> set:
+    return set(re.findall(r"\b[a-z]+\b", text)) & _VARIANT_WORDS
+
+
+def _has_word(word: str, text: str) -> bool:
+    return re.search(rf"\b{re.escape(word)}\b", text) is not None
+
+
+def _prepare_image_for_vlm(image_bytes: bytes, max_dim: int = 1536) -> Tuple[bytes, str]:
+    """Resize high-res scans to fit within max_dim to avoid ROCm token explosion & gateway timeouts."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img_format = img.format if img.format in {"JPEG", "PNG"} else "JPEG"
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            
+            w, h = img.size
+            if max(w, h) > max_dim:
+                scale = max_dim / max(w, h)
+                new_size = (int(w * scale), int(h * scale))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            out_buf = io.BytesIO()
+            img.save(out_buf, format=img_format, quality=85, optimize=True)
+            mime = "image/jpeg" if img_format == "JPEG" else "image/png"
+            return out_buf.getvalue(), mime
+    except Exception:
+        # Fallback to original bytes if PIL fails
+        return image_bytes, "image/jpeg"
+
+
 class AmdLlmAdapter:
+    _CAPABILITY_KEYS = (
+        "capabilities",
+        "input_modalities",
+        "modalities",
+        "supported_modalities",
+        "architecture",
+        "vision",
+        "supports_vision",
+        "image_input",
+    )
+
     def __init__(self, host: Optional[str] = None, model: Optional[str] = None):
-        self.host = (host or settings.AMD_ROCM_HOST).rstrip("/")
-        self.model = model if model is not None else settings.AMD_ROCM_MODEL
+        self.host = (host or settings.AMD_ROCM_HOST or "").rstrip("/")
+        self.model = (model if model is not None else settings.AMD_ROCM_MODEL) or ""
         self.timeout = settings.EXTERNAL_TIMEOUT_SECONDS
         self.max_retries = settings.MAX_RETRIES
+        self._vision_validated = False
 
     def _require_configured(self) -> None:
         if not settings.AMD_ROCM_ENABLED:
@@ -49,13 +114,13 @@ class AmdLlmAdapter:
     def _retry_after_seconds(value: Optional[str], attempt: int) -> float:
         if value:
             try:
-                return min(30.0, max(0.0, float(value)))
+                return min(65.0, max(0.0, float(value)))
             except ValueError:
                 try:
                     retry_at = parsedate_to_datetime(value)
                     if retry_at.tzinfo is None:
                         retry_at = retry_at.replace(tzinfo=timezone.utc)
-                    return min(30.0, max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds()))
+                    return min(65.0, max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds()))
                 except (TypeError, ValueError, OverflowError):
                     pass
         return min(30.0, (2 ** attempt) + random.uniform(0.0, 0.25))
@@ -64,7 +129,10 @@ class AmdLlmAdapter:
         self._require_configured()
         headers = dict(kwargs.pop("headers", {}))
         headers["Authorization"] = f"Bearer {settings.AMD_ROCM_API_KEY}"
-        retryable_statuses = {429, 502, 503}
+        
+        # Include 504 Gateway Timeout in retryable statuses
+        retryable_statuses = {429, 502, 503, 504}
+        
         for attempt in range(self.max_retries + 1):
             try:
                 response = httpx.request(
@@ -85,10 +153,20 @@ class AmdLlmAdapter:
                     continue
                 raise ProviderRequestError("AMD endpoint could not be reached.") from exc
 
-            if response.status_code in retryable_statuses and attempt < self.max_retries:
+            # Retry if status code is in retryable_statuses or is a 500 wrapping an upstream 504
+            is_upstream_timeout_500 = (
+                response.status_code == 500 and "504" in response.text
+            )
+            if (response.status_code in retryable_statuses or is_upstream_timeout_500) and attempt < self.max_retries:
                 time.sleep(self._retry_after_seconds(response.headers.get("Retry-After"), attempt))
                 continue
+
             if response.is_error:
+                logger.warning(
+                    "AMD endpoint returned HTTP %s (%s).",
+                    response.status_code,
+                    self._error_summary(response),
+                )
                 raise ProviderRequestError(f"AMD endpoint returned HTTP {response.status_code}.")
             return response
         raise ProviderRequestError("AMD request retry policy was exhausted.")
@@ -120,8 +198,9 @@ class AmdLlmAdapter:
         return any(model.get(key) is True for key in ("vision", "supports_vision", "image_input"))
 
     def discover_vision_model(self) -> str:
-        """Validate the configured model against live provider capability metadata."""
         self._require_configured()
+        if self._vision_validated:
+            return self.model
         response = self._request("GET", "models")
         try:
             catalog = response.json().get("data", [])
@@ -137,11 +216,67 @@ class AmdLlmAdapter:
             raise ProviderNotConfiguredError(
                 "Configured AMD_ROCM_MODEL is not present in the live model catalog."
             )
-        if not self._supports_images(selected):
-            raise ProviderNotConfiguredError(
-                "Configured AMD_ROCM_MODEL is not marked as image-capable by the live catalog."
+        advertises = any(key in selected for key in self._CAPABILITY_KEYS)
+        if advertises and not self._supports_images(selected):
+            logger.warning(
+                "Model %s does not advertise image input in the live catalog; attempting anyway.",
+                self.model,
             )
+        self._vision_validated = True
         return self.model
+
+    @staticmethod
+    def _parse_json_content(content: Any) -> Any:
+        """Parse model output as JSON, tolerating thinking tags, text preamble, and code fences."""
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        if not isinstance(content, str):
+            raise ValueError("Model content was not text.")
+        text = content.strip()
+        # Remove <think>...</think> tags if present
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        
+        # Extract content from markdown code fences if wrapped
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if match:
+            text = match.group(1).strip()
+        else:
+            first_brace = text.find("{")
+            first_bracket = text.find("[")
+            start = -1
+            if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+                start = first_brace
+                end = text.rfind("}")
+            elif first_bracket != -1:
+                start = first_bracket
+                end = text.rfind("]")
+            if start != -1 and end != -1:
+                text = text[start:end + 1]
+
+        return json.loads(text.strip())
+
+    @staticmethod
+    def _chat_options(max_tokens: int) -> Dict[str, Any]:
+        options: Dict[str, Any] = {"max_tokens": max_tokens}
+        effort = getattr(settings, "AMD_ROCM_REASONING_EFFORT", "low")
+        if effort:
+            options["reasoning_effort"] = effort
+        return options
+
+    @staticmethod
+    def _error_summary(response: httpx.Response) -> str:
+        try:
+            body = response.json()
+        except ValueError:
+            return "unparseable error body"
+        error = body.get("detail", body) if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            error = error.get("error", error)
+        if isinstance(error, dict):
+            return f"{error.get('code') or error.get('type') or 'unknown'}: {str(error.get('message') or '')[:200]}"
+        return "unrecognised error body"
 
     def _record_call(
         self,
@@ -151,8 +286,14 @@ class AmdLlmAdapter:
         completion_tokens: int = 0,
         task: str = "leaflet_extraction",
     ) -> None:
+        if status == "success":
+            event_type = "llm_call"
+        elif status == "error":
+            event_type = "error"
+        else:
+            event_type = "fallback"
         trace_collector.record(TraceEvent(
-            event_type="llm_call" if status == "success" else "fallback",
+            event_type=event_type,
             device=settings.AMD_ROCM_DEVICE if settings.AMD_ROCM_DEVICE != "not_configured" else "remote",
             rocm_version=settings.AMD_ROCM_VERSION,
             model=self.model,
@@ -172,13 +313,16 @@ class AmdLlmAdapter:
         filename: str,
     ) -> Dict[str, Any]:
         started = time.perf_counter()
-        mime_type = mimetypes.guess_type(filename)[0]
-        if mime_type not in {"image/jpeg", "image/png"}:
-            raise ValueError("AMD leaflet extraction accepts JPEG or PNG images only.")
-        image_uri = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        
+        # Prepare & resize image to prevent ROCm GPU memory overload and gateway timeouts
+        processed_bytes, mime_type = _prepare_image_for_vlm(image_bytes, max_dim=1536)
+        image_uri = f"data:{mime_type};base64,{base64.b64encode(processed_bytes).decode('ascii')}"
+
         try:
             self._require_configured()
             self.discover_vision_model()
+            
+            # Using 3072 max_tokens ensures quick response without memory starvation
             response = self._request(
                 "POST",
                 "chat/completions",
@@ -192,24 +336,71 @@ class AmdLlmAdapter:
                         ],
                     }],
                     "response_format": {"type": "json_object"},
+                    **self._chat_options(3072),
                 },
             )
             payload = response.json()
             content = payload["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            parsed = self._parse_json_content(content) 
+
+            # Extract list of items
+            items = None
             if isinstance(parsed, list):
                 items = parsed
             elif isinstance(parsed, dict):
-                items = parsed.get("extracted_items", parsed.get("items"))
-            else:
-                items = None
+                items = (
+                    parsed.get("extracted_items")
+                    or parsed.get("items")
+                    or parsed.get("offers")
+                    or parsed.get("products")
+                )
+                if items is None:
+                    # Check nested objects if wrapped under a document/leaflet key
+                    for val in parsed.values():
+                        if isinstance(val, dict) and "extracted_items" in val:
+                            items = val["extracted_items"]
+                            break
+                        if isinstance(val, list) and val and isinstance(val[0], dict):
+                            items = val
+                            break
+
             if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
                 raise ProviderRequestError("AMD returned an invalid leaflet candidate structure.")
+
+            # Sanitize LLM values so they satisfy the schema
+            cleaned_items = []
+            for item in items:
+                curr = str(item.get("currency") or "").strip().upper()
+                if curr in {"R", "RAND", "RANDS"}:
+                    curr = "ZAR"
+
+                raw_price = item.get("pack_price", item.get("supplier_price", item.get("price")))
+                if isinstance(raw_price, str):
+                    clean_price = re.sub(r"[^\d.]", "", raw_price.replace(",", ""))
+                    try:
+                        raw_price = float(clean_price) if clean_price else None
+                    except ValueError:
+                        raw_price = None
+
+                conf = item.get("confidence")
+                if isinstance(conf, (int, float)) and conf > 1.0:
+                    conf = min(1.0, conf / 100.0)
+
+                cleaned_item = dict(item)
+                if curr:
+                    cleaned_item["currency"] = curr
+                if raw_price is not None:
+                    cleaned_item["pack_price"] = raw_price
+                if conf is not None:
+                    cleaned_item["confidence"] = conf
+                cleaned_items.append(cleaned_item)
+
             usage = payload.get("usage") or {}
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
             completion_tokens = int(usage.get("completion_tokens") or 0)
             self._record_call(started, "success", prompt_tokens, completion_tokens)
-            return {"extracted_items": items, "source": "amd"}
+            return {"status": "completed", "extracted_items": cleaned_items, "source": "amd"}
+            
         except ProviderNotConfiguredError:
             self._record_call(started, "error")
             raise
@@ -221,7 +412,6 @@ class AmdLlmAdapter:
             raise ProviderRequestError("AMD returned an invalid leaflet response.") from exc
 
     def extract_leaflet_text(self, image_data_or_url: str, prompt: str) -> Dict[str, Any]:
-        """Return a local fixture for legacy/demo callers; uploads use the provider path."""
         started = time.perf_counter()
         result = self._fallback_extract(prompt)
         trace_collector.record(TraceEvent(
@@ -237,27 +427,40 @@ class AmdLlmAdapter:
         return result
 
     def adjudicate_product_match(self, internal_product: str, candidate_supplier_item: str, score: float) -> Dict[str, Any]:
-        """Perform deterministic product matching; no model call is made."""
         clean_int = internal_product.lower().strip()
         clean_cand = candidate_supplier_item.lower().strip()
         is_match = False
         rationale = "Heuristic match based on brand and volume equivalence"
         confidence = score
 
-        if "coca-cola" in clean_int and ("coke" in clean_cand or "coca-cola" in clean_cand):
-            is_match, rationale, confidence = True, "Identified brand synonym: Coke -> Coca-Cola, package volumes compatible", 0.96
-        elif "sprite" in clean_int and "sprite" in clean_cand:
-            is_match, rationale, confidence = True, "Direct match on brand and bottle size", 0.98
-        elif "noodles" in clean_int and ("noodles" in clean_cand or "ramen" in clean_cand):
-            is_match, rationale, confidence = True, "Category match on instant noodle pack", 0.92
-        elif "bread" in clean_int and ("bread" in clean_cand or "loaf" in clean_cand):
-            is_match, rationale, confidence = True, "Bakery staple match: Standard Brown Bread 700g", 0.88
-        elif "oil" in clean_int and "oil" in clean_cand:
-            is_match, rationale, confidence = True, "Cooking Oil cooking fat category match", 0.89
+        int_size = _first_size(clean_int)
+        cand_size = _first_size(clean_cand)
+        int_variants = _variants(clean_int)
+        cand_variants = _variants(clean_cand)
+
+        if int_size and cand_size and int_size != cand_size:
+            rationale = "Pack sizes differ, so these are not the same product"
+        elif (int_variants ^ cand_variants) & _SUGAR_VARIANTS or (
+            int_variants and cand_variants and int_variants != cand_variants
+        ):
+            rationale = "Product variants differ (e.g. zero/diet or white/brown)"
+        elif _has_word("coca-cola", clean_int) and (_has_word("coke", clean_cand) or _has_word("coca-cola", clean_cand)):
+            is_match, rationale, confidence = True, "Identified brand synonym: Coke -> Coca-Cola", min(score, 0.96) if score else 0.96
+        elif _has_word("sprite", clean_int) and _has_word("sprite", clean_cand):
+            is_match, rationale, confidence = True, "Direct match on brand", min(score, 0.98) if score else 0.98
+        elif _has_word("noodles", clean_int) and (_has_word("noodles", clean_cand) or _has_word("ramen", clean_cand)):
+            is_match, rationale, confidence = True, "Category match on instant noodle pack", min(score, 0.92) if score else 0.92
+        elif _has_word("bread", clean_int) and (_has_word("bread", clean_cand) or _has_word("loaf", clean_cand)):
+            is_match, rationale, confidence = True, "Bakery staple category match", min(score, 0.88) if score else 0.88
+        elif _has_word("oil", clean_int) and _has_word("oil", clean_cand):
+            is_match, rationale, confidence = True, "Cooking oil category match", min(score, 0.89) if score else 0.89
         elif score >= 0.75:
-            is_match, rationale = True, f"High fuzzy similarity ({round(score * 100)}%) with compatible pack sizes"
+            is_match, rationale = True, f"High fuzzy similarity ({round(score * 100)}%)"
         else:
             rationale = f"Insufficient match confidence ({round(score * 100)}%)"
+
+        if is_match and not (int_size and cand_size):
+            rationale += "; pack size not confirmed, verify before ordering"
 
         trace_collector.record(TraceEvent(
             event_type="tool_call",
@@ -319,6 +522,7 @@ class AmdLlmAdapter:
                             + json.dumps(plan_data, sort_keys=True)
                         ),
                     }],
+                    **self._chat_options(2048),
                 },
             )
             payload = response.json()
@@ -348,17 +552,28 @@ class AmdLlmAdapter:
             return fallback
 
     def _fallback_extract(self, prompt: str) -> Dict[str, Any]:
+        def item(product: str, pack_size: str, supplier: str, price: float, unit_price: float) -> Dict[str, Any]:
+            return {
+                "product": product,
+                "pack_size": pack_size,
+                "supplier": supplier,
+                "price": price,
+                "pack_price": price,
+                "unit_price": unit_price,
+            }
+
         return {
+            "status": "completed",
             "source": "local_demo_fixture",
             "extracted_items": [
-                {"product": "Coca-Cola 440ml", "pack_size": "24 x 440ml", "supplier": "Makro", "price": 289.00, "unit_price": 12.04},
-                {"product": "Sprite 440ml", "pack_size": "24 x 440ml", "supplier": "Makro", "price": 275.50, "unit_price": 11.48},
-                {"product": "Chicken Flavour Noodles", "pack_size": "5 x 70g", "supplier": "Shoprite", "price": 42.00, "unit_price": 8.40},
-                {"product": "Brown Bread", "pack_size": "1 x 700g", "supplier": "Usave", "price": 16.50, "unit_price": 16.50},
-                {"product": "Milk (long life)", "pack_size": "6 x 1L", "supplier": "Usave", "price": 84.00, "unit_price": 14.00},
-                {"product": "Cooking Oil", "pack_size": "6 x 1L", "supplier": "Makro", "price": 210.00, "unit_price": 35.00},
-                {"product": "Twizza Carbonated Drink 500ml", "pack_size": "24 x 500ml", "supplier": "Jumbo", "price": 168.00, "unit_price": 7.00},
-                {"product": "Jive Soda 440ml", "pack_size": "24 x 440ml", "supplier": "Shoprite", "price": 180.00, "unit_price": 7.50},
+                item("Coca-Cola 440ml", "24 x 440ml", "Makro", 289.00, 12.04),
+                item("Sprite 440ml", "24 x 440ml", "Makro", 275.50, 11.48),
+                item("Chicken Flavour Noodles", "5 x 70g", "Shoprite", 42.00, 8.40),
+                item("Brown Bread", "1 x 700g", "Usave", 16.50, 16.50),
+                item("Milk (long life)", "6 x 1L", "Usave", 84.00, 14.00),
+                item("Cooking Oil", "6 x 1L", "Makro", 210.00, 35.00),
+                item("Twizza Carbonated Drink 500ml", "24 x 500ml", "Jumbo", 168.00, 7.00),
+                item("Jive Soda 440ml", "24 x 440ml", "Shoprite", 180.00, 7.50),
             ],
         }
 
