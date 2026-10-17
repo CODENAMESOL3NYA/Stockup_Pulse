@@ -218,9 +218,8 @@ class AmdLlmAdapter:
             )
         advertises = any(key in selected for key in self._CAPABILITY_KEYS)
         if advertises and not self._supports_images(selected):
-            logger.warning(
-                "Model %s does not advertise image input in the live catalog; attempting anyway.",
-                self.model,
+            raise ProviderNotConfiguredError(
+                 f"Configured AMD_ROCM_MODEL '{self.model}' is not marked as image-capable in the live model catalog."
             )
         self._vision_validated = True
         return self.model
@@ -286,12 +285,7 @@ class AmdLlmAdapter:
         completion_tokens: int = 0,
         task: str = "leaflet_extraction",
     ) -> None:
-        if status == "success":
-            event_type = "llm_call"
-        elif status == "error":
-            event_type = "error"
-        else:
-            event_type = "fallback"
+        event_type = "llm_call" if status == "success" else "fallback"
         trace_collector.record(TraceEvent(
             event_type=event_type,
             device=settings.AMD_ROCM_DEVICE if settings.AMD_ROCM_DEVICE != "not_configured" else "remote",
@@ -453,14 +447,11 @@ class AmdLlmAdapter:
                     "warnings": warnings,
                 })
 
-            if not cleaned_items:
-                raise ProviderRequestError("No valid products could be extracted from the leaflet.")
-
             usage = payload.get("usage") or {}
             prompt_tokens = int(usage.get("prompt_tokens") or 0)
             completion_tokens = int(usage.get("completion_tokens") or 0)
             self._record_call(started, "success", prompt_tokens, completion_tokens)
-            return {"status": "completed", "extracted_items": cleaned_items, "source": "amd"}
+            return {"extracted_items": cleaned_items, "source": "amd"}
             
         except ProviderNotConfiguredError:
             self._record_call(started, "error")

@@ -133,7 +133,7 @@ class EvolusAdapter:
                 submitted = client.post(
                     execute_url,
                     headers=self._headers(),
-                    data={"input": None},
+                    data={"input": prompt},
                     files={"file": (filename, file_content, "application/pdf")},
                 )
                 if submitted.status_code != 202:

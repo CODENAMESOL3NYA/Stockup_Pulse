@@ -335,6 +335,7 @@ class LiveRetailScraper:
         # Deduplicate
         unique = {}
         for row in records:
+            print(row)
             key = (row.product_url, row.product_name, row.price_zar)
             unique[key] = row
         return list(unique.values())
