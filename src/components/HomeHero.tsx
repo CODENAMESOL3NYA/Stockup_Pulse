@@ -80,8 +80,8 @@ export const HomeHero: React.FC<HomeHeroProps> = ({ onGetStarted, onUseDemoData 
         <div className="lg:col-span-5 relative">
           <div className="relative rounded-[4px] overflow-hidden border border-[#333333] bg-[#1A1A1A] group">
             <img
-              src="https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?auto=format&fit=crop&w=800&q=80"
-              alt="South African retail store owner"
+              src="https://images.unsplash.com/photo-1751473680515-90ae42d900b3?auto=format&fit=crop&w=800&q=80"
+              alt="South A small rural shop with trees in the Western Cape"
               className="w-full h-[460px] object-cover object-center opacity-80 group-hover:scale-102 transition-transform duration-500"
             />
             {/* Dark gradient overlay */}
