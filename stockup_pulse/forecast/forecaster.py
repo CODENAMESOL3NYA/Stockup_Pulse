@@ -1,14 +1,22 @@
 """
-StockUp Pulse - Deterministic Demand Forecaster & WAPE Metric
-Pure mathematical/statistical forecasting:
-- Moving Average / Exponential Smoothing with day-of-week seasonality
-- Lead-time buffer and safety stock (Z * sigma * sqrt(L))
-- Transparent reporting of Model WAPE vs Baseline WAPE
-The LLM is NEVER used here.
+StockUp Pulse - Demand Forecaster with Spaza Perishability, Intermittent Sizing & WAPE
 """
 
-from typing import Dict, List, Any
+import math
+from typing import Any, Dict, List
 import numpy as np
+
+# Perishability days lookup for township retail categories
+SHELF_LIFE_DAYS = {
+    "bakery": 4,        # Fresh bread spoils in 3-4 days
+    "dairy": 7,         # Amasi / fresh milk
+    "produce": 5,
+    "soft drinks": 180,
+    "staples": 180,     # Maize meal, sugar, flour
+    "canned goods": 365,
+    "general": 90
+}
+
 
 def calculate_wape(actual: np.ndarray, predicted: np.ndarray) -> float:
     """
@@ -22,64 +30,76 @@ def calculate_wape(actual: np.ndarray, predicted: np.ndarray) -> float:
         return 0.0
     return float(np.sum(np.abs(actual - predicted)) / denom)
 
+
 class DemandForecaster:
-    def __init__(self, service_level_z: float = 1.645): # 95% service level
-        self.z = service_level_z
+    def __init__(self, default_service_z: float = 1.645):
+        self.z = default_service_z
 
     def forecast_item(
         self,
         sales_history: List[float],
         lead_time_days: int,
         planning_horizon_days: int = 14,
-        current_stock: float = 0.0
+        current_stock: float = 0.0,
+        category: str = "general",
+        units_per_pack: int = 1,
+        is_kvi: bool = False
     ) -> Dict[str, Any]:
-        """
-        Calculate deterministic demand forecast, safety stock, and reorder recommendation.
-        """
         if not sales_history:
-            raise ValueError("Sales history is required for a demand forecast.")
+            raise ValueError("Sales history is required for forecasting.")
+            
         hist = np.array(sales_history, dtype=float)
-
-        # Baseline: simple 7-day rolling average
-        baseline_daily = float(np.mean(hist[-7:] if len(hist) >= 7 else hist))
         
-        # Enhanced statistical model: Day-of-week weighted exponential smoothing
+        # Day-of-week weighted exponential smoothing
         alpha = 0.35
         smoothed = hist[0]
         for val in hist[1:]:
             smoothed = alpha * val + (1 - alpha) * smoothed
-        model_daily = float(smoothed)
+        daily_demand = max(0.1, float(smoothed))
         
-        # Volatility & Safety Stock
-        std_dev = float(np.std(hist)) if len(hist) > 1 else 0.5
-        safety_stock = int(np.ceil(self.z * std_dev * np.sqrt(max(1, lead_time_days))))
+        # Safety stock calculation
+        std_dev = float(np.std(hist)) if len(hist) > 1 else math.sqrt(daily_demand)
+        service_z = 2.05 if is_kvi else self.z  # Higher protection for KVI staples
+        safety_stock = int(np.ceil(service_z * std_dev * math.sqrt(max(1, lead_time_days))))
         
-        # Horizon demand
-        expected_demand = model_daily * planning_horizon_days
+        # Shelf-life constraint
+        category_shelf_life = SHELF_LIFE_DAYS.get(str(category).lower(), 60)
+        effective_horizon = min(planning_horizon_days, category_shelf_life)
         
-        # Gross requirement = demand during (lead_time + horizon) + safety_stock
-        gross_req = (model_daily * lead_time_days) + expected_demand + safety_stock
-        net_reorder_needed = max(0, int(np.ceil(gross_req - current_stock)))
+        horizon_demand = daily_demand * effective_horizon
+        gross_needed = (daily_demand * lead_time_days) + horizon_demand + safety_stock
+        net_units_needed = max(0.0, gross_needed - current_stock)
         
-        # Stockout risk check: if stock runs out before supplier delivers
-        runout_days = (current_stock / model_daily) if model_daily > 0 else 999.0
+        # Convert loose units into integer wholesale packs
+        units_per_pack = max(1, units_per_pack)
+        recommended_packs = int(math.ceil(net_units_needed / units_per_pack))
+        recommended_qty = int(math.ceil(net_units_needed))
+        
+        runout_days = (current_stock / daily_demand) if daily_demand > 0 else 999.0
         at_risk = runout_days < lead_time_days
 
         return {
-            "daily_demand_forecast": round(model_daily, 2),
-            "safety_stock": safety_stock,
-            "horizon_demand": round(expected_demand, 1),
-            "recommended_qty": net_reorder_needed,
-            "runout_days": round(runout_days, 1),
+            # Legacy keys (maintains orchestrator & test compatibility)
+            "recommended_qty": recommended_qty,
             "at_risk_before_delivery": at_risk,
-            "lead_time_days": lead_time_days
+            "daily_demand_forecast": round(daily_demand, 2),
+            "lead_time_days": lead_time_days,
+            "horizon_demand": round(horizon_demand, 1),
+            
+            # OR keys (pack-level logic & perishability)
+            "daily_demand": round(daily_demand, 2),
+            "effective_horizon_days": effective_horizon,
+            "safety_stock": safety_stock,
+            "net_units_needed": round(net_units_needed, 1),
+            "units_per_pack": units_per_pack,
+            "recommended_packs": recommended_packs,
+            "runout_days": round(runout_days, 1),
+            "at_risk": at_risk,
+            "is_spoilage_risk": effective_horizon < planning_horizon_days
         }
 
-    def evaluate_wape(self) -> Dict[str, float]:
-        """
-        Illustrative WAPE calculation on a synthetic fixture, not historical store data.
-        """
-        # Synthetic fixture data keeps the metric endpoint testable without claiming field validation.
+    def evaluate_wape(self) -> Dict[str, Any]:
+        """Illustrative WAPE calculation on synthetic fixtures."""
         actuals = np.array([45, 32, 28, 60, 18, 50, 42, 12, 85, 30])
         baseline_preds = np.array([55, 25, 35, 48, 25, 62, 33, 16, 70, 38])
         model_preds = np.array([47, 30, 29, 57, 19, 53, 40, 13, 80, 31])
@@ -95,5 +115,6 @@ class DemandForecaster:
             "dataset_type": "illustrative_fixture",
             "sample_count": int(len(actuals)),
         }
+
 
 forecaster = DemandForecaster()
