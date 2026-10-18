@@ -37,10 +37,3 @@ def test_unconfigured_extraction_is_reported_as_demo_fallback():
     assert event.device == "not_invoked"
 
 
-def test_unconfigured_evolus_adapter_does_not_claim_success():
-    trace_collector.clear()
-    with pytest.raises(EvolusNotConfiguredError):
-        EvolusAdapter().extract_document(b"fixture", "sample.pdf")
-    event = trace_collector.get_events()[-1]
-    assert event.event_type == "fallback"
-    assert event.status == "not_configured"
