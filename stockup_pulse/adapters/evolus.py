@@ -31,12 +31,36 @@ class EvolusAdapter:
         application_id: Optional[str] = None,
         workflow_id: Optional[str] = None,
     ):
-        self.api_key = api_key if api_key is not None else settings.EVOLUS_API_KEY
-        self.endpoint = (endpoint or settings.EVOLUS_ENDPOINT).rstrip("/")
-        self.application_id = application_id if application_id is not None else settings.EVOLUS_APPLICATION_ID
-        self.workflow_id = workflow_id if workflow_id is not None else settings.EVOLUS_WORKFLOW_ID
-        self.timeout = settings.EVOLUS_EXECUTION_TIMEOUT_SECONDS
-        self.poll_interval = settings.EVOLUS_POLL_INTERVAL_SECONDS
+        self._api_key = api_key
+        self._endpoint = endpoint
+        self._application_id = application_id
+        self._workflow_id = workflow_id
+
+    # Dynamic properties ensure monkeypatched settings in tests are immediately respected
+    @property
+    def api_key(self) -> Optional[str]:
+        return self._api_key if self._api_key is not None else settings.EVOLUS_API_KEY
+
+    @property
+    def endpoint(self) -> str:
+        raw = self._endpoint or settings.EVOLUS_ENDPOINT or ""
+        return raw.rstrip("/")
+
+    @property
+    def application_id(self) -> Optional[str]:
+        return self._application_id if self._application_id is not None else settings.EVOLUS_APPLICATION_ID
+
+    @property
+    def workflow_id(self) -> Optional[str]:
+        return self._workflow_id if self._workflow_id is not None else settings.EVOLUS_WORKFLOW_ID
+
+    @property
+    def timeout(self) -> float:
+        return settings.EVOLUS_EXECUTION_TIMEOUT_SECONDS
+
+    @property
+    def poll_interval(self) -> float:
+        return settings.EVOLUS_POLL_INTERVAL_SECONDS
 
     def _require_configured(self) -> None:
         if not settings.EVOLUS_ENABLED:
@@ -48,8 +72,8 @@ class EvolusAdapter:
 
     def _headers(self) -> Dict[str, str]:
         return {
-            "X-ApiKey": self.api_key,
-            "X-Application-Id": self.application_id,
+            "X-ApiKey": self.api_key or "",
+            "X-Application-Id": self.application_id or "",
             "Accept": "application/json",
         }
 
@@ -77,7 +101,7 @@ class EvolusAdapter:
             raw_name = line.get("raw_name") or line.get("product_name")
             price = line.get("pack_price")
             if not raw_name or not isinstance(price, (int, float)):
-                continue  # or collect these as rejected lines for review
+                continue
             promo = line.get("promo") if isinstance(line.get("promo"), dict) else {}
             conf = line.get("confidence")
             conf_vals = (
@@ -121,14 +145,23 @@ class EvolusAdapter:
         if not filename.lower().endswith(".pdf"):
             raise ValueError("Evolus document extraction accepts PDF files only.")
         started = time.perf_counter()
+        
+        # Check configuration first before initiating deadlines or requests
+        try:
+            self._require_configured()
+        except EvolusNotConfiguredError:
+            self._record("not_configured", started)
+            raise
+
         if self.timeout <= 0 or self.poll_interval <= 0:
             self._record("not_configured", started)
             raise EvolusNotConfiguredError("Evolus timeout and poll interval must be positive.")
+
         deadline = time.monotonic() + self.timeout
-        workflow = quote(self.workflow_id, safe="")
+        workflow = quote(self.workflow_id or "", safe="")
         execute_url = f"{self.endpoint}/workflows/{workflow}/execute"
+        
         try:
-            self._require_configured()
             with httpx.Client(timeout=min(30.0, self.timeout), follow_redirects=False) as client:
                 submitted = client.post(
                     execute_url,
@@ -183,13 +216,11 @@ class EvolusAdapter:
                         result = execution.get("output")
                         if result is None:
                             result = execution.get("result")
-                        # 1) Decode a JSON string first (it may hold the "lines" document).
                         if isinstance(result, str):
                             try:
                                 result = json.loads(result)
                             except ValueError as exc:
                                 raise EvolusRequestError("Evolus workflow result was not valid JSON.") from exc
-                        # 2) Then unwrap/normalise whichever dict shape arrived.
                         if isinstance(result, dict) and "lines" in result:
                             result = self._normalise_lines(result)
                         elif isinstance(result, dict):
