@@ -24,7 +24,7 @@ services:
         value: "false"
       # CORS: Allows requests from the frontend dashboard
       - key: CORS_ORIGINS
-        value: "*"
+        value: '["*"]'
 
   # ==========================================================
   # 2. React Dashboard + Express Proxy
