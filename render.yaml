@@ -1,0 +1,47 @@
+version: "1"
+services:
+  # ==========================================================
+  # 1. FastAPI Backend
+  # ==========================================================
+  - type: web
+    name: stockup-pulse-api
+    runtime: python
+    plan: free
+    region: frankfurt # Change to oregon, ohio, or singapore if preferred
+    buildCommand: pip install --upgrade pip && pip install -r stockup_pulse/requirements.txt
+    startCommand: python -m uvicorn stockup_pulse.api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: SQLITE_DB_PATH
+        value: ./stockup_pulse.db
+      # Provider Integrations (Disabled by default per README; set to true in dashboard if needed)
+      - key: AMD_ROCM_ENABLED
+        value: "true"
+      - key: EVOLUS_ENABLED
+        value: "true"
+      - key: TWILIO_WEBHOOK_ENABLED
+        value: "false"
+      # CORS: Allows requests from the frontend dashboard
+      - key: CORS_ORIGINS
+        value: "*"
+
+  # ==========================================================
+  # 2. React Dashboard + Express Proxy
+  # ==========================================================
+  - type: web
+    name: stockup-pulse-dashboard
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      # Express server proxies /api calls internally to the FastAPI service
+      - key: PYTHON_API_URL
+        fromService:
+          type: web
+          name: stockup-pulse-api
+          property: host
